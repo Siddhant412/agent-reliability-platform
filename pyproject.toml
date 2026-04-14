@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-reliability-platform"
+version = "0.1.0"
+description = "Backend foundation for an enterprise agent reliability platform."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "alembic>=1.16.5",
+  "fastapi>=0.116.1",
+  "psycopg[binary]>=3.2.10",
+  "pydantic>=2.11.4",
+  "pydantic-settings>=2.10.1",
+  "sqlalchemy>=2.0.43",
+  "uvicorn>=0.35.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28.1",
+  "pytest>=9.0.2",
+  "pytest-cov>=6.3.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "apps/api/src/arp_api",
+  "packages/backend-core/src/arp_core",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/README.md",
+  "/agent_reliability_platform_spec.md",
+  "/apps",
+  "/docs",
+  "/packages",
+  "/tests",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "apps/api/src",
+  "packages/backend-core/src",
+]
+testpaths = ["tests"]
+
