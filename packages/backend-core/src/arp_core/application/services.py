@@ -7,12 +7,13 @@ from sqlalchemy.orm import Session, joinedload
 
 from arp_core.application.audit import record_audit_event
 from arp_core.application.exceptions import ConflictError, NotFoundError
+from arp_core.application.auth import AuthenticatedActor
 from arp_core.contracts.run import RunSubmitRequest
-from arp_core.contracts.tenant import OrganizationCreate, ProjectCreate
+from arp_core.contracts.tenant import MembershipCreate, OrganizationCreate, ProjectCreate
 from arp_core.contracts.workflow import PublishWorkflowVersionRequest, WorkflowCreate, WorkflowVersionCreate
-from arp_core.domain.enums import RunStatus, WorkflowVersionStatus
+from arp_core.domain.enums import MembershipRole, RunStatus, WorkflowVersionStatus
 from arp_core.persistence.base import utcnow
-from arp_core.persistence.models import Organization, Project, Run, Workflow, WorkflowVersion
+from arp_core.persistence.models import Membership, Organization, Project, Run, Workflow, WorkflowVersion
 
 
 def _first_or_404(session: Session, statement: Select, message: str):
@@ -24,6 +25,66 @@ def _first_or_404(session: Session, statement: Select, message: str):
 
 def list_organizations(session: Session) -> list[Organization]:
     return list(session.scalars(select(Organization).order_by(Organization.created_at.desc())).all())
+
+
+def list_organizations_for_actor(session: Session, *, actor_user_id: UUID) -> list[Organization]:
+    return list(
+        session.scalars(
+            select(Organization)
+            .join(Membership, Membership.org_id == Organization.id)
+            .where(Membership.user_id == actor_user_id)
+            .distinct()
+            .order_by(Organization.created_at.desc())
+        ).all()
+    )
+
+
+def _find_membership(
+    session: Session,
+    *,
+    user_id: UUID,
+    org_id: UUID,
+    project_id: UUID | None,
+) -> Membership | None:
+    statement = select(Membership).where(Membership.user_id == user_id, Membership.org_id == org_id)
+    if project_id is None:
+        statement = statement.where(Membership.project_id.is_(None))
+    else:
+        statement = statement.where(Membership.project_id == project_id)
+    return session.scalar(statement)
+
+
+def _ensure_membership(
+    session: Session,
+    *,
+    user_id: UUID,
+    org_id: UUID,
+    project_id: UUID | None,
+    role: MembershipRole,
+) -> Membership:
+    existing = _find_membership(session, user_id=user_id, org_id=org_id, project_id=project_id)
+    if existing is not None:
+        return existing
+
+    membership = Membership(
+        user_id=user_id,
+        org_id=org_id,
+        project_id=project_id,
+        role=role,
+    )
+    session.add(membership)
+    session.flush()
+    return membership
+
+
+def list_actor_memberships(session: Session, *, actor: AuthenticatedActor) -> list[Membership]:
+    return list(
+        session.scalars(
+            select(Membership)
+            .where(Membership.user_id == actor.user_id)
+            .order_by(Membership.org_id, Membership.project_id, Membership.created_at)
+        ).all()
+    )
 
 
 def create_organization(
@@ -39,6 +100,14 @@ def create_organization(
     organization = Organization(name=payload.name, slug=payload.slug)
     session.add(organization)
     session.flush()
+    if actor_user_id is not None:
+        _ensure_membership(
+            session,
+            user_id=actor_user_id,
+            org_id=organization.id,
+            project_id=None,
+            role=MembershipRole.ORG_ADMIN,
+        )
 
     record_audit_event(
         session,
@@ -85,6 +154,14 @@ def create_project(
     )
     session.add(project)
     session.flush()
+    if actor_user_id is not None:
+        _ensure_membership(
+            session,
+            user_id=actor_user_id,
+            org_id=org_id,
+            project_id=project.id,
+            role=MembershipRole.PROJECT_ADMIN,
+        )
 
     record_audit_event(
         session,
@@ -106,6 +183,104 @@ def list_workflows(session: Session, *, project_id: UUID) -> list[Workflow]:
             select(Workflow).where(Workflow.project_id == project_id).order_by(Workflow.created_at.desc())
         ).all()
     )
+
+
+def list_org_memberships(session: Session, *, org_id: UUID) -> list[Membership]:
+    return list(
+        session.scalars(
+            select(Membership)
+            .where(Membership.org_id == org_id, Membership.project_id.is_(None))
+            .order_by(Membership.created_at.desc())
+        ).all()
+    )
+
+
+def list_project_memberships(session: Session, *, project_id: UUID) -> list[Membership]:
+    return list(
+        session.scalars(
+            select(Membership)
+            .where(Membership.project_id == project_id)
+            .order_by(Membership.created_at.desc())
+        ).all()
+    )
+
+
+def create_org_membership(
+    session: Session,
+    *,
+    org_id: UUID,
+    payload: MembershipCreate,
+    actor_user_id: UUID | None,
+) -> Membership:
+    _first_or_404(session, select(Organization).where(Organization.id == org_id), "organization not found")
+    existing = _find_membership(session, user_id=payload.user_id, org_id=org_id, project_id=None)
+    if existing is not None:
+        raise ConflictError("organization membership already exists for this user")
+
+    membership = Membership(
+        user_id=payload.user_id,
+        org_id=org_id,
+        project_id=None,
+        role=payload.role,
+    )
+    session.add(membership)
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=org_id,
+        project_id=None,
+        action="membership.create",
+        resource_type="membership",
+        resource_id=membership.id,
+        before_json=None,
+        after_json={
+            "user_id": str(membership.user_id),
+            "role": membership.role.value,
+            "scope": "organization",
+        },
+    )
+    return membership
+
+
+def create_project_membership(
+    session: Session,
+    *,
+    project_id: UUID,
+    payload: MembershipCreate,
+    actor_user_id: UUID | None,
+) -> Membership:
+    project = _first_or_404(session, select(Project).where(Project.id == project_id), "project not found")
+    existing = _find_membership(session, user_id=payload.user_id, org_id=project.org_id, project_id=project_id)
+    if existing is not None:
+        raise ConflictError("project membership already exists for this user")
+
+    membership = Membership(
+        user_id=payload.user_id,
+        org_id=project.org_id,
+        project_id=project_id,
+        role=payload.role,
+    )
+    session.add(membership)
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=project.org_id,
+        project_id=project_id,
+        action="membership.create",
+        resource_type="membership",
+        resource_id=membership.id,
+        before_json=None,
+        after_json={
+            "user_id": str(membership.user_id),
+            "role": membership.role.value,
+            "scope": "project",
+        },
+    )
+    return membership
 
 
 def create_workflow(

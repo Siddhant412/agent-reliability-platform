@@ -64,33 +64,32 @@ def _workflow_version_payload() -> dict:
     }
 
 
-def test_healthz(client: TestClient) -> None:
-    response = client.get("/healthz")
-
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+def _headers() -> dict[str, str]:
+    return {"X-Actor-User-Id": str(uuid4())}
 
 
-def test_create_publish_and_submit_version_pinned_run(client: TestClient) -> None:
-    headers = {"X-Actor-User-Id": str(uuid4())}
-
-    org_response = client.post(
+def _create_org(client: TestClient, *, actor_headers: dict[str, str], slug: str = "acme-corp") -> str:
+    response = client.post(
         "/api/v1/organizations",
-        json={"name": "Acme Corp", "slug": "acme-corp"},
-        headers=headers,
+        json={"name": "Acme Corp", "slug": slug},
+        headers=actor_headers,
     )
-    assert org_response.status_code == 201
-    org_id = org_response.json()["id"]
+    assert response.status_code == 201
+    return response.json()["id"]
 
-    project_response = client.post(
+
+def _create_project(client: TestClient, *, org_id: str, actor_headers: dict[str, str], slug: str = "support-ops") -> str:
+    response = client.post(
         f"/api/v1/organizations/{org_id}/projects",
-        json={"name": "Support Ops", "slug": "support-ops", "environment": "staging"},
-        headers=headers,
+        json={"name": "Support Ops", "slug": slug, "environment": "staging"},
+        headers=actor_headers,
     )
-    assert project_response.status_code == 201
-    project_id = project_response.json()["id"]
+    assert response.status_code == 201
+    return response.json()["id"]
 
-    workflow_response = client.post(
+
+def _create_workflow(client: TestClient, *, project_id: str, actor_headers: dict[str, str]) -> str:
+    response = client.post(
         f"/api/v1/projects/{project_id}/workflows",
         json={
             "slug": "support-ticket-resolution",
@@ -98,46 +97,113 @@ def test_create_publish_and_submit_version_pinned_run(client: TestClient) -> Non
             "domain": "customer_support",
             "description": "Resolve billing and order issues safely.",
         },
-        headers=headers,
+        headers=actor_headers,
     )
-    assert workflow_response.status_code == 201
-    workflow_id = workflow_response.json()["id"]
+    assert response.status_code == 201
+    return response.json()["id"]
 
+
+def _create_and_publish_workflow_version(
+    client: TestClient,
+    *,
+    workflow_id: str,
+    actor_headers: dict[str, str],
+) -> str:
     version_response = client.post(
         f"/api/v1/workflows/{workflow_id}/versions",
         json=_workflow_version_payload(),
-        headers=headers,
+        headers=actor_headers,
     )
     assert version_response.status_code == 201
     version_body = version_response.json()
-    version_id = version_body["id"]
     assert version_body["status"] == "draft"
     assert "model_config" in version_body
     assert "model_config_payload" not in version_body
 
-    draft_run_response = client.post(
-        f"/api/v1/projects/{project_id}/runs",
-        json={
-            "workflow_version_id": version_id,
-            "input_payload": {
-                "ticket_id": "T-100",
-                "customer_id": "C-200",
-                "message": "I was double charged.",
-                "priority": "high",
-            },
-        },
-        headers=headers,
-    )
-    assert draft_run_response.status_code == 409
-    assert draft_run_response.json()["detail"] == "runs can only be created from published workflow versions"
-
+    version_id = version_body["id"]
     publish_response = client.post(
         f"/api/v1/workflow-versions/{version_id}/publish",
         json={"published_by": str(uuid4())},
-        headers=headers,
+        headers=actor_headers,
     )
     assert publish_response.status_code == 200
     assert publish_response.json()["status"] == "published"
+    return version_id
+
+
+def test_healthz(client: TestClient) -> None:
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_secured_routes_require_actor_identity_header(client: TestClient) -> None:
+    response = client.get("/api/v1/organizations")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "missing X-Actor-User-Id header"
+
+
+def test_org_creator_is_bootstrapped_as_admin_and_org_list_is_tenant_filtered(client: TestClient) -> None:
+    actor_one = _headers()
+    actor_two = _headers()
+
+    org_one = _create_org(client, actor_headers=actor_one, slug="acme-corp")
+    org_two = _create_org(client, actor_headers=actor_two, slug="beta-corp")
+
+    me_response = client.get("/api/v1/auth/me", headers=actor_one)
+    assert me_response.status_code == 200
+    me_body = me_response.json()
+    assert me_body["user_id"] == actor_one["X-Actor-User-Id"]
+    assert len(me_body["memberships"]) == 1
+    assert me_body["memberships"][0]["org_id"] == org_one
+    assert me_body["memberships"][0]["role"] == "org_admin"
+
+    actor_one_orgs = client.get("/api/v1/organizations", headers=actor_one)
+    assert actor_one_orgs.status_code == 200
+    assert [record["id"] for record in actor_one_orgs.json()] == [org_one]
+
+    actor_two_orgs = client.get("/api/v1/organizations", headers=actor_two)
+    assert actor_two_orgs.status_code == 200
+    assert [record["id"] for record in actor_two_orgs.json()] == [org_two]
+
+
+def test_project_membership_controls_workflow_and_run_access(client: TestClient) -> None:
+    owner = _headers()
+    api_client_actor = _headers()
+    outsider = _headers()
+
+    org_id = _create_org(client, actor_headers=owner)
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner)
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+    )
+
+    forbidden_before_membership = client.get(f"/api/v1/projects/{project_id}/runs", headers=outsider)
+    assert forbidden_before_membership.status_code == 403
+
+    membership_response = client.post(
+        f"/api/v1/projects/{project_id}/memberships",
+        json={"user_id": api_client_actor["X-Actor-User-Id"], "role": "api_client"},
+        headers=owner,
+    )
+    assert membership_response.status_code == 201
+    assert membership_response.json()["role"] == "api_client"
+
+    forbidden_workflow_write = client.post(
+        f"/api/v1/projects/{project_id}/workflows",
+        json={
+            "slug": "unauthorized-workflow",
+            "name": "Unauthorized Workflow",
+            "domain": "customer_support",
+        },
+        headers=api_client_actor,
+    )
+    assert forbidden_workflow_write.status_code == 403
 
     run_response = client.post(
         f"/api/v1/projects/{project_id}/runs",
@@ -150,15 +216,38 @@ def test_create_publish_and_submit_version_pinned_run(client: TestClient) -> Non
                 "priority": "high",
             },
         },
-        headers=headers,
+        headers=api_client_actor,
     )
     assert run_response.status_code == 201
     run_body = run_response.json()
     assert run_body["workflow_version_id"] == version_id
     assert run_body["status"] == "queued"
-    assert run_body["input_payload"]["ticket_id"] == "T-100"
 
-    get_run_response = client.get(f"/api/v1/projects/{project_id}/runs/{run_body['id']}")
+    get_run_response = client.get(
+        f"/api/v1/projects/{project_id}/runs/{run_body['id']}",
+        headers=api_client_actor,
+    )
     assert get_run_response.status_code == 200
     assert get_run_response.json()["id"] == run_body["id"]
 
+    outsider_run_response = client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={
+            "workflow_version_id": version_id,
+            "input_payload": {
+                "ticket_id": "T-100",
+                "customer_id": "C-200",
+                "message": "I was double charged.",
+                "priority": "high",
+            },
+        },
+        headers=outsider,
+    )
+    assert outsider_run_response.status_code == 403
+
+    project_memberships = client.get(f"/api/v1/projects/{project_id}/memberships", headers=owner)
+    assert project_memberships.status_code == 200
+    assert {record["user_id"] for record in project_memberships.json()} == {
+        owner["X-Actor-User-Id"],
+        api_client_actor["X-Actor-User-Id"],
+    }

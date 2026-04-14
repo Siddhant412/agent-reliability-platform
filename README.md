@@ -38,3 +38,6 @@ uv sync --dev
 uv run alembic -c alembic.ini upgrade head
 uv run uvicorn arp_api.main:app --reload
 ```
+
+Use `X-Actor-User-Id: <uuid>` when calling secured API routes in local
+development.

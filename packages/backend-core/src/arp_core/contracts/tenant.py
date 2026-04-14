@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from arp_core.domain.enums import ProjectEnvironment
+from arp_core.domain.enums import MembershipRole, ProjectEnvironment
 
 
 class OrganizationCreate(BaseModel):
@@ -38,3 +38,18 @@ class ProjectRead(BaseModel):
     environment: ProjectEnvironment
     created_at: datetime
 
+
+class MembershipCreate(BaseModel):
+    user_id: UUID
+    role: MembershipRole
+
+
+class MembershipRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    user_id: UUID
+    org_id: UUID
+    project_id: UUID | None = None
+    role: MembershipRole
+    created_at: datetime

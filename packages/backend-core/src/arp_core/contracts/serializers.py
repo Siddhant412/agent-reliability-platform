@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from arp_core.contracts.run import RunRead
-from arp_core.contracts.tenant import OrganizationRead, ProjectRead
+from arp_core.contracts.tenant import MembershipRead, OrganizationRead, ProjectRead
 from arp_core.contracts.workflow import (
     ModelConfig,
     WorkflowPolicyRule,
@@ -12,7 +12,7 @@ from arp_core.contracts.workflow import (
     WorkflowToolRef,
     WorkflowVersionRead,
 )
-from arp_core.persistence.models import Organization, Project, Run, Workflow, WorkflowVersion
+from arp_core.persistence.models import Membership, Organization, Project, Run, Workflow, WorkflowVersion
 
 
 def organization_to_read(record: Organization) -> OrganizationRead:
@@ -21,6 +21,10 @@ def organization_to_read(record: Organization) -> OrganizationRead:
 
 def project_to_read(record: Project) -> ProjectRead:
     return ProjectRead.model_validate(record)
+
+
+def membership_to_read(record: Membership) -> MembershipRead:
+    return MembershipRead.model_validate(record)
 
 
 def workflow_to_read(record: Workflow) -> WorkflowRead:
@@ -70,4 +74,3 @@ def run_to_read(record: Run) -> RunRead:
         feedback_score=record.feedback_score,
         created_at=record.created_at,
     )
-
