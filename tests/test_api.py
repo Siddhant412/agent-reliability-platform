@@ -251,3 +251,78 @@ def test_project_membership_controls_workflow_and_run_access(client: TestClient)
         owner["X-Actor-User-Id"],
         api_client_actor["X-Actor-User-Id"],
     }
+
+
+def test_draft_versions_can_be_updated_but_only_valid_definitions_can_publish(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="gamma-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="ops-gamma")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+
+    invalid_payload = _workflow_version_payload()
+    invalid_payload["version"] = "2.0.0"
+    invalid_payload["input_schema"] = {"type": "not-a-real-json-schema-type"}
+
+    version_response = client.post(
+        f"/api/v1/workflows/{workflow_id}/versions",
+        json=invalid_payload,
+        headers=owner,
+    )
+    assert version_response.status_code == 201
+    version_id = version_response.json()["id"]
+
+    get_draft_response = client.get(f"/api/v1/workflow-versions/{version_id}", headers=owner)
+    assert get_draft_response.status_code == 200
+    assert get_draft_response.json()["version"] == "2.0.0"
+
+    invalid_publish_response = client.post(
+        f"/api/v1/workflow-versions/{version_id}/publish",
+        json={"published_by": owner["X-Actor-User-Id"]},
+        headers=owner,
+    )
+    assert invalid_publish_response.status_code == 400
+    assert "input_schema is not a valid JSON Schema" in invalid_publish_response.json()["detail"]
+
+    patch_response = client.patch(
+        f"/api/v1/workflow-versions/{version_id}",
+        json={
+            "version": "2.0.1",
+            "input_schema": {
+                "type": "object",
+                "required": ["ticket_id", "customer_id", "message"],
+                "properties": {
+                    "ticket_id": {"type": "string"},
+                    "customer_id": {"type": "string"},
+                    "message": {"type": "string"},
+                    "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                },
+            },
+            "tool_set": ["kb_search", "get_customer_profile", "issue_refund"],
+        },
+        headers=owner,
+    )
+    assert patch_response.status_code == 200
+    patched_body = patch_response.json()
+    assert patched_body["version"] == "2.0.1"
+    assert [tool["name"] for tool in patched_body["tool_set"]] == [
+        "kb_search",
+        "get_customer_profile",
+        "issue_refund",
+    ]
+
+    publish_response = client.post(
+        f"/api/v1/workflow-versions/{version_id}/publish",
+        json={"published_by": owner["X-Actor-User-Id"]},
+        headers=owner,
+    )
+    assert publish_response.status_code == 200
+    assert publish_response.json()["status"] == "published"
+
+    update_published_response = client.patch(
+        f"/api/v1/workflow-versions/{version_id}",
+        json={"prompt_template": "Do not allow this edit."},
+        headers=owner,
+    )
+    assert update_published_response.status_code == 409
+    assert update_published_response.json()["detail"] == "only draft workflow versions can be updated"

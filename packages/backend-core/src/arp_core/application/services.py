@@ -10,10 +10,16 @@ from arp_core.application.exceptions import ConflictError, NotFoundError
 from arp_core.application.auth import AuthenticatedActor
 from arp_core.contracts.run import RunSubmitRequest
 from arp_core.contracts.tenant import MembershipCreate, OrganizationCreate, ProjectCreate
-from arp_core.contracts.workflow import PublishWorkflowVersionRequest, WorkflowCreate, WorkflowVersionCreate
+from arp_core.contracts.workflow import (
+    PublishWorkflowVersionRequest,
+    WorkflowCreate,
+    WorkflowVersionCreate,
+    WorkflowVersionUpdate,
+)
 from arp_core.domain.enums import MembershipRole, RunStatus, WorkflowVersionStatus
 from arp_core.persistence.base import utcnow
 from arp_core.persistence.models import Membership, Organization, Project, Run, Workflow, WorkflowVersion
+from arp_core.workflow_registry.validation import build_workflow_definition_document, validate_workflow_definition
 
 
 def _first_or_404(session: Session, statement: Select, message: str):
@@ -21,6 +27,16 @@ def _first_or_404(session: Session, statement: Select, message: str):
     if result is None:
         raise NotFoundError(message)
     return result
+
+
+def _workflow_version_snapshot(record: WorkflowVersion) -> dict[str, object]:
+    return {
+        "version": record.version,
+        "status": record.status.value,
+        "tool_count": len(record.tool_set_json),
+        "policy_count": len(record.policy_pack_json),
+        "guardrail_count": len(record.guardrails_json),
+    }
 
 
 def list_organizations(session: Session) -> list[Organization]:
@@ -361,13 +377,13 @@ def create_workflow_version(
         prompt_template=payload.prompt_template,
         input_schema_json=payload.input_schema,
         output_schema_json=payload.output_schema,
-        model_config_json=payload.model_config_payload.model_dump(mode="json"),
-        policy_pack_json=[policy.model_dump(mode="json") for policy in payload.policy_pack],
-        tool_set_json=[tool.model_dump(mode="json") for tool in payload.tool_set],
+        model_config_json=payload.model_config_payload.model_dump(mode="json", exclude_none=True),
+        policy_pack_json=[policy.model_dump(mode="json", exclude_none=True) for policy in payload.policy_pack],
+        tool_set_json=[tool.model_dump(mode="json", exclude_none=True) for tool in payload.tool_set],
         guardrails_json=list(payload.guardrails),
         rollout_config_json=payload.rollout_config.model_dump(mode="json") if payload.rollout_config else None,
         eval_dataset_bindings_json=[str(dataset_id) for dataset_id in payload.eval_dataset_bindings],
-        created_by=payload.created_by,
+        created_by=payload.created_by or actor_user_id,
     )
     session.add(version)
     session.flush()
@@ -381,7 +397,93 @@ def create_workflow_version(
         resource_type="workflow_version",
         resource_id=version.id,
         before_json=None,
-        after_json={"workflow_id": str(workflow_id), "version": version.version, "status": version.status.value},
+        after_json={"workflow_id": str(workflow_id), **_workflow_version_snapshot(version)},
+    )
+    return version
+
+
+def get_workflow_version(session: Session, *, workflow_version_id: UUID) -> WorkflowVersion:
+    return _first_or_404(
+        session,
+        select(WorkflowVersion).where(WorkflowVersion.id == workflow_version_id),
+        "workflow version not found",
+    )
+
+
+def update_workflow_version(
+    session: Session,
+    *,
+    workflow_version_id: UUID,
+    payload: WorkflowVersionUpdate,
+    actor_user_id: UUID | None,
+) -> WorkflowVersion:
+    version = _first_or_404(
+        session,
+        select(WorkflowVersion)
+        .options(joinedload(WorkflowVersion.workflow).joinedload(Workflow.project))
+        .where(WorkflowVersion.id == workflow_version_id),
+        "workflow version not found",
+    )
+    if version.status != WorkflowVersionStatus.DRAFT:
+        raise ConflictError("only draft workflow versions can be updated")
+
+    if payload.version is not None and payload.version != version.version:
+        existing = session.scalar(
+            select(WorkflowVersion).where(
+                WorkflowVersion.workflow_id == version.workflow_id,
+                WorkflowVersion.version == payload.version,
+                WorkflowVersion.id != workflow_version_id,
+            )
+        )
+        if existing is not None:
+            raise ConflictError(f"workflow version '{payload.version}' already exists")
+
+    before_snapshot = _workflow_version_snapshot(version)
+    changed_fields: list[str] = []
+
+    if payload.version is not None:
+        version.version = payload.version
+        changed_fields.append("version")
+    if payload.prompt_template is not None:
+        version.prompt_template = payload.prompt_template
+        changed_fields.append("prompt_template")
+    if payload.input_schema is not None:
+        version.input_schema_json = payload.input_schema
+        changed_fields.append("input_schema")
+    if payload.output_schema is not None:
+        version.output_schema_json = payload.output_schema
+        changed_fields.append("output_schema")
+    if payload.model_config_payload is not None:
+        version.model_config_json = payload.model_config_payload.model_dump(mode="json", exclude_none=True)
+        changed_fields.append("model_config")
+    if payload.policy_pack is not None:
+        version.policy_pack_json = [policy.model_dump(mode="json", exclude_none=True) for policy in payload.policy_pack]
+        changed_fields.append("policy_pack")
+    if payload.tool_set is not None:
+        version.tool_set_json = [tool.model_dump(mode="json", exclude_none=True) for tool in payload.tool_set]
+        changed_fields.append("tool_set")
+    if payload.guardrails is not None:
+        version.guardrails_json = list(payload.guardrails)
+        changed_fields.append("guardrails")
+    if payload.rollout_config is not None:
+        version.rollout_config_json = payload.rollout_config.model_dump(mode="json")
+        changed_fields.append("rollout_config")
+    if payload.eval_dataset_bindings is not None:
+        version.eval_dataset_bindings_json = [str(dataset_id) for dataset_id in payload.eval_dataset_bindings]
+        changed_fields.append("eval_dataset_bindings")
+
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=version.workflow.project.org_id,
+        project_id=version.workflow.project_id,
+        action="workflow_version.update",
+        resource_type="workflow_version",
+        resource_id=version.id,
+        before_json=before_snapshot,
+        after_json={**_workflow_version_snapshot(version), "changed_fields": changed_fields},
     )
     return version
 
@@ -403,6 +505,9 @@ def publish_workflow_version(
     if version.status != WorkflowVersionStatus.DRAFT:
         raise ConflictError("only draft workflow versions can be published")
 
+    validate_workflow_definition(build_workflow_definition_document(version.workflow, version))
+    before_snapshot = _workflow_version_snapshot(version)
+
     version.status = WorkflowVersionStatus.PUBLISHED
     version.published_at = utcnow()
     session.flush()
@@ -415,8 +520,11 @@ def publish_workflow_version(
         action="workflow_version.publish",
         resource_type="workflow_version",
         resource_id=version.id,
-        before_json={"status": WorkflowVersionStatus.DRAFT.value},
-        after_json={"status": WorkflowVersionStatus.PUBLISHED.value, "published_at": version.published_at.isoformat()},
+        before_json=before_snapshot,
+        after_json={
+            **_workflow_version_snapshot(version),
+            "published_at": version.published_at.isoformat(),
+        },
     )
     return version
 

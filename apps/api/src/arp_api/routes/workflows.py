@@ -23,6 +23,7 @@ from arp_core.contracts.workflow import (
     WorkflowRead,
     WorkflowVersionCreate,
     WorkflowVersionRead,
+    WorkflowVersionUpdate,
 )
 
 
@@ -65,6 +66,19 @@ def list_workflow_versions(
     ]
 
 
+@router.get("/api/v1/workflow-versions/{workflow_version_id}", response_model=WorkflowVersionRead)
+def get_workflow_version(
+    workflow_version_id: UUID,
+    _: Annotated[
+        authz.WorkflowVersionAccess,
+        Depends(require_workflow_version_access(permission=authz.ensure_project_can_read)),
+    ],
+    session: Annotated[Session, Depends(get_db_session)],
+) -> WorkflowVersionRead:
+    version = services.get_workflow_version(session, workflow_version_id=workflow_version_id)
+    return workflow_version_to_read(version)
+
+
 @router.post(
     "/api/v1/workflows/{workflow_id}/versions",
     response_model=WorkflowVersionRead,
@@ -83,6 +97,26 @@ def create_workflow_version(
     version = services.create_workflow_version(
         session,
         workflow_id=workflow_id,
+        payload=payload,
+        actor_user_id=actor.user_id,
+    )
+    return workflow_version_to_read(version)
+
+
+@router.patch("/api/v1/workflow-versions/{workflow_version_id}", response_model=WorkflowVersionRead)
+def update_workflow_version(
+    workflow_version_id: UUID,
+    payload: WorkflowVersionUpdate,
+    _: Annotated[
+        authz.WorkflowVersionAccess,
+        Depends(require_workflow_version_access(permission=authz.ensure_project_can_write_workflows)),
+    ],
+    session: Annotated[Session, Depends(get_db_session)],
+    actor: Annotated[AuthenticatedActor, Depends(get_authenticated_actor)],
+) -> WorkflowVersionRead:
+    version = services.update_workflow_version(
+        session,
+        workflow_version_id=workflow_version_id,
         payload=payload,
         actor_user_id=actor.user_id,
     )

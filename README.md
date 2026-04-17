@@ -37,6 +37,7 @@ docs/
 uv sync --dev
 uv run alembic -c alembic.ini upgrade head
 uv run uvicorn arp_api.main:app --reload
+uv run python scripts/seed_support_workflow.py
 ```
 
 Use `X-Actor-User-Id: <uuid>` when calling secured API routes in local

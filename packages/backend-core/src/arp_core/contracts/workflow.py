@@ -17,6 +17,13 @@ class ModelConfig(BaseModel):
 
 
 class WorkflowToolRef(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_string_value(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"name": value}
+        return value
+
     name: str = Field(min_length=1, max_length=120)
     connector_id: UUID | None = None
 
@@ -100,6 +107,25 @@ class WorkflowVersionCreate(BaseModel):
     rollout_config: WorkflowRolloutConfig | None = None
     eval_dataset_bindings: list[UUID] = Field(default_factory=list)
     created_by: UUID | None = None
+
+
+class WorkflowVersionUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    version: str | None = Field(default=None, min_length=1, max_length=64)
+    prompt_template: str | None = Field(default=None, min_length=1)
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
+    model_config_payload: ModelConfig | None = Field(
+        default=None,
+        validation_alias="model_config",
+        serialization_alias="model_config",
+    )
+    policy_pack: list[WorkflowPolicyRule] | None = None
+    tool_set: list[WorkflowToolRef] | None = None
+    guardrails: list[str] | None = None
+    rollout_config: WorkflowRolloutConfig | None = None
+    eval_dataset_bindings: list[UUID] | None = None
 
 
 class WorkflowVersionRead(BaseModel):

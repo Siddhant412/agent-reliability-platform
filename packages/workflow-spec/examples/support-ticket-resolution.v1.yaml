@@ -1,0 +1,103 @@
+workflow:
+  name: Support Ticket Resolution
+  slug: support-ticket-resolution
+  domain: customer_support
+  version: 1.0.0
+  description: Resolve customer billing and order issues safely.
+  prompt_template: |
+    You are a customer support operations agent.
+    Investigate the customer issue, gather supporting context with read-only tools,
+    propose safe next actions, and never execute risky actions without policy approval.
+    Produce a structured response matching the output schema.
+  input_schema:
+    type: object
+    additionalProperties: false
+    required:
+      - ticket_id
+      - customer_id
+      - message
+    properties:
+      ticket_id:
+        type: string
+      customer_id:
+        type: string
+      message:
+        type: string
+      priority:
+        type: string
+        enum:
+          - low
+          - medium
+          - high
+  output_schema:
+    type: object
+    additionalProperties: false
+    required:
+      - summary
+      - disposition
+      - proposed_actions
+      - customer_reply
+      - confidence
+    properties:
+      summary:
+        type: string
+      disposition:
+        type: string
+        enum:
+          - resolved
+          - escalated
+          - awaiting_approval
+      proposed_actions:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - tool
+            - reason
+          properties:
+            tool:
+              type: string
+            reason:
+              type: string
+      customer_reply:
+        type: string
+      confidence:
+        type: number
+  model:
+    provider: openai
+    name: gpt-5
+    temperature: 0.2
+  tools:
+    - kb_search
+    - get_customer_profile
+    - get_order
+    - issue_refund
+    - post_ticket_comment
+    - send_customer_email
+  policies:
+    - name: refund_approval
+      when: tool.name == 'issue_refund' and tool.args.amount > 100
+      action: require_approval
+      approver_role: supervisor
+    - name: external_email_guard
+      when: tool.name == 'send_customer_email' and input.priority == 'high'
+      action: require_approval
+      approver_role: team_lead
+  guardrails:
+    - sanitize_tool_inputs
+    - redact_secrets_from_traces
+    - detect_prompt_injection
+    - enforce_output_schema
+  rollout:
+    strategy: canary
+    baseline_version: 1.0.0
+    candidate_version: 1.1.0
+    traffic_split:
+      baseline: 90
+      candidate: 10
+    rollback_thresholds:
+      policy_violation_rate: 0
+      schema_failure_rate: 0.01
+      p95_latency_ms: 30000
+  eval_dataset_bindings: []
