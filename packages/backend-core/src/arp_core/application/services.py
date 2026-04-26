@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError as JSONSchemaValidationError
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session, joinedload
 
 from arp_core.application.audit import record_audit_event
-from arp_core.application.exceptions import ConflictError, NotFoundError
+from arp_core.application.exceptions import ApplicationError, ConflictError, NotFoundError
 from arp_core.application.auth import AuthenticatedActor
-from arp_core.contracts.run import RunSubmitRequest
+from arp_core.contracts.run import RunSubmitRequest, RunTransitionRequest, TraceSpanCreate, WorkflowRunSubmitRequest
 from arp_core.contracts.tenant import MembershipCreate, OrganizationCreate, ProjectCreate
 from arp_core.contracts.workflow import (
     PublishWorkflowVersionRequest,
@@ -18,7 +21,7 @@ from arp_core.contracts.workflow import (
 )
 from arp_core.domain.enums import MembershipRole, RunStatus, WorkflowVersionStatus
 from arp_core.persistence.base import utcnow
-from arp_core.persistence.models import Membership, Organization, Project, Run, Workflow, WorkflowVersion
+from arp_core.persistence.models import Membership, Organization, Project, Run, TraceSpan, Workflow, WorkflowVersion
 from arp_core.workflow_registry.validation import build_workflow_definition_document, validate_workflow_definition
 
 
@@ -37,6 +40,99 @@ def _workflow_version_snapshot(record: WorkflowVersion) -> dict[str, object]:
         "policy_count": len(record.policy_pack_json),
         "guardrail_count": len(record.guardrails_json),
     }
+
+
+def _json_schema_error_location(exc: JSONSchemaValidationError) -> str:
+    location = "input_payload"
+    for path_part in exc.absolute_path:
+        if isinstance(path_part, int):
+            location += f"[{path_part}]"
+        else:
+            location += f".{path_part}"
+    return location
+
+
+def _validate_run_input_payload(*, input_schema: dict, input_payload: dict) -> None:
+    try:
+        Draft202012Validator.check_schema(input_schema)
+        Draft202012Validator(input_schema).validate(input_payload)
+    except SchemaError as exc:
+        raise ApplicationError(f"workflow input_schema is invalid: {exc.message}") from exc
+    except JSONSchemaValidationError as exc:
+        location = _json_schema_error_location(exc)
+        raise ApplicationError(f"{location}: {exc.message}") from exc
+
+
+TERMINAL_RUN_STATUSES = {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}
+ALLOWED_RUN_STATUS_TRANSITIONS = {
+    RunStatus.QUEUED: {RunStatus.RUNNING, RunStatus.CANCELLED},
+    RunStatus.RUNNING: {
+        RunStatus.AWAITING_APPROVAL,
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
+    RunStatus.AWAITING_APPROVAL: {RunStatus.RESUMED, RunStatus.FAILED, RunStatus.CANCELLED},
+    RunStatus.RESUMED: {RunStatus.RUNNING, RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED},
+    RunStatus.SUCCEEDED: set(),
+    RunStatus.FAILED: set(),
+    RunStatus.CANCELLED: set(),
+}
+
+
+def _ensure_run_transition_allowed(*, current_status: RunStatus, next_status: RunStatus) -> None:
+    if current_status == next_status:
+        return
+    if next_status not in ALLOWED_RUN_STATUS_TRANSITIONS[current_status]:
+        raise ConflictError(f"invalid run status transition: {current_status.value} -> {next_status.value}")
+
+
+def _latency_ms_between(started_at: datetime, ended_at: datetime) -> int:
+    if started_at.tzinfo is None and ended_at.tzinfo is not None:
+        ended_at = ended_at.replace(tzinfo=None)
+    elif started_at.tzinfo is not None and ended_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=None)
+    return max(0, int((ended_at - started_at).total_seconds() * 1000))
+
+
+def _create_run_for_version(
+    session: Session,
+    *,
+    project_id: UUID,
+    version: WorkflowVersion,
+    input_payload: dict,
+    triggered_by: UUID | None,
+    actor_user_id: UUID | None,
+) -> Run:
+    _validate_run_input_payload(input_schema=version.input_schema_json, input_payload=input_payload)
+
+    run = Run(
+        project_id=project_id,
+        workflow_version_id=version.id,
+        triggered_by=triggered_by,
+        status=RunStatus.QUEUED,
+        input_json=input_payload,
+        started_at=None,
+        ended_at=None,
+    )
+    session.add(run)
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id or triggered_by,
+        org_id=version.workflow.project.org_id,
+        project_id=project_id,
+        action="run.submit",
+        resource_type="run",
+        resource_id=run.id,
+        before_json=None,
+        after_json={
+            "workflow_version_id": str(version.id),
+            "status": run.status.value,
+        },
+    )
+    return run
 
 
 def list_organizations(session: Session) -> list[Organization]:
@@ -555,33 +651,49 @@ def submit_run(
     if version.status != WorkflowVersionStatus.PUBLISHED:
         raise ConflictError("runs can only be created from published workflow versions")
 
-    run = Run(
-        project_id=project_id,
-        workflow_version_id=version.id,
-        triggered_by=payload.triggered_by,
-        status=RunStatus.QUEUED,
-        input_json=payload.input_payload,
-        started_at=None,
-        ended_at=None,
-    )
-    session.add(run)
-    session.flush()
-
-    record_audit_event(
+    return _create_run_for_version(
         session,
-        actor_user_id=actor_user_id or payload.triggered_by,
-        org_id=version.workflow.project.org_id,
         project_id=project_id,
-        action="run.submit",
-        resource_type="run",
-        resource_id=run.id,
-        before_json=None,
-        after_json={
-            "workflow_version_id": str(version.id),
-            "status": run.status.value,
-        },
+        version=version,
+        input_payload=payload.input_payload,
+        triggered_by=payload.triggered_by,
+        actor_user_id=actor_user_id,
     )
-    return run
+
+
+def submit_workflow_run(
+    session: Session,
+    *,
+    project_id: UUID,
+    workflow_slug: str,
+    payload: WorkflowRunSubmitRequest,
+    actor_user_id: UUID | None,
+) -> Run:
+    workflow = _first_or_404(
+        session,
+        select(Workflow).where(Workflow.project_id == project_id, Workflow.slug == workflow_slug),
+        "workflow not found",
+    )
+    version = session.scalar(
+        select(WorkflowVersion)
+        .options(joinedload(WorkflowVersion.workflow).joinedload(Workflow.project))
+        .where(
+            WorkflowVersion.workflow_id == workflow.id,
+            WorkflowVersion.status == WorkflowVersionStatus.PUBLISHED,
+        )
+        .order_by(WorkflowVersion.published_at.desc(), WorkflowVersion.created_at.desc())
+    )
+    if version is None:
+        raise NotFoundError("published workflow version not found")
+
+    return _create_run_for_version(
+        session,
+        project_id=project_id,
+        version=version,
+        input_payload=payload.input_payload,
+        triggered_by=payload.triggered_by,
+        actor_user_id=actor_user_id,
+    )
 
 
 def get_run(session: Session, *, project_id: UUID, run_id: UUID) -> Run:
@@ -590,3 +702,89 @@ def get_run(session: Session, *, project_id: UUID, run_id: UUID) -> Run:
         select(Run).where(Run.project_id == project_id, Run.id == run_id),
         "run not found",
     )
+
+
+def transition_run_status(
+    session: Session,
+    *,
+    project_id: UUID,
+    run_id: UUID,
+    payload: RunTransitionRequest,
+) -> Run:
+    run = get_run(session, project_id=project_id, run_id=run_id)
+    _ensure_run_transition_allowed(current_status=run.status, next_status=payload.status)
+    if payload.final_output is not None and payload.status != RunStatus.SUCCEEDED:
+        raise ConflictError("final_output can only be set when a run succeeds")
+
+    now = utcnow()
+    run.status = payload.status
+    if payload.status == RunStatus.RUNNING and run.started_at is None:
+        run.started_at = now
+    if payload.status in TERMINAL_RUN_STATUSES and run.ended_at is None:
+        run.ended_at = now
+        if run.started_at is not None and payload.latency_ms is None:
+            run.latency_ms = _latency_ms_between(run.started_at, run.ended_at)
+
+    if payload.final_output is not None:
+        run.final_output_json = payload.final_output
+    if payload.latency_ms is not None:
+        run.latency_ms = payload.latency_ms
+    if payload.cost_usd is not None:
+        run.cost_usd = payload.cost_usd
+    if payload.tokens_input is not None:
+        run.tokens_input = payload.tokens_input
+    if payload.tokens_output is not None:
+        run.tokens_output = payload.tokens_output
+
+    session.flush()
+    return run
+
+
+def list_trace_spans(session: Session, *, project_id: UUID, run_id: UUID) -> list[TraceSpan]:
+    get_run(session, project_id=project_id, run_id=run_id)
+    return list(
+        session.scalars(
+            select(TraceSpan)
+            .where(TraceSpan.project_id == project_id, TraceSpan.run_id == run_id)
+            .order_by(TraceSpan.started_at, TraceSpan.created_at)
+        ).all()
+    )
+
+
+def create_trace_span(
+    session: Session,
+    *,
+    project_id: UUID,
+    run_id: UUID,
+    payload: TraceSpanCreate,
+) -> TraceSpan:
+    run = get_run(session, project_id=project_id, run_id=run_id)
+    existing = session.scalar(
+        select(TraceSpan).where(
+            TraceSpan.project_id == project_id,
+            TraceSpan.run_id == run_id,
+            TraceSpan.trace_id == payload.trace_id,
+            TraceSpan.span_id == payload.span_id,
+        )
+    )
+    if existing is not None:
+        raise ConflictError("trace span already exists")
+
+    span = TraceSpan(
+        project_id=project_id,
+        workflow_version_id=run.workflow_version_id,
+        run_id=run_id,
+        trace_id=payload.trace_id,
+        span_id=payload.span_id,
+        parent_span_id=payload.parent_span_id,
+        span_type=payload.span_type,
+        name=payload.name,
+        status=payload.status,
+        started_at=payload.started_at or utcnow(),
+        ended_at=payload.ended_at,
+        attributes_json=payload.attributes,
+        error_json=payload.error,
+    )
+    session.add(span)
+    session.flush()
+    return span

@@ -5,9 +5,9 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 
-def _workflow_version_payload() -> dict:
+def _workflow_version_payload(*, version: str = "1.0.0") -> dict:
     return {
-        "version": "1.0.0",
+        "version": version,
         "prompt_template": "Resolve support tickets safely.",
         "input_schema": {
             "type": "object",
@@ -108,10 +108,11 @@ def _create_and_publish_workflow_version(
     *,
     workflow_id: str,
     actor_headers: dict[str, str],
+    version: str = "1.0.0",
 ) -> str:
     version_response = client.post(
         f"/api/v1/workflows/{workflow_id}/versions",
-        json=_workflow_version_payload(),
+        json=_workflow_version_payload(version=version),
         headers=actor_headers,
     )
     assert version_response.status_code == 201
@@ -230,6 +231,24 @@ def test_project_membership_controls_workflow_and_run_access(client: TestClient)
     assert get_run_response.status_code == 200
     assert get_run_response.json()["id"] == run_body["id"]
 
+    invalid_run_response = client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={
+            "workflow_version_id": version_id,
+            "input_payload": {
+                "ticket_id": "T-101",
+                "customer_id": "C-201",
+            },
+        },
+        headers=api_client_actor,
+    )
+    assert invalid_run_response.status_code == 400
+    assert invalid_run_response.json()["detail"] == "input_payload: 'message' is a required property"
+
+    runs_response = client.get(f"/api/v1/projects/{project_id}/runs", headers=api_client_actor)
+    assert runs_response.status_code == 200
+    assert [record["id"] for record in runs_response.json()] == [run_body["id"]]
+
     outsider_run_response = client.post(
         f"/api/v1/projects/{project_id}/runs",
         json={
@@ -251,6 +270,191 @@ def test_project_membership_controls_workflow_and_run_access(client: TestClient)
         owner["X-Actor-User-Id"],
         api_client_actor["X-Actor-User-Id"],
     }
+
+
+def test_workflow_slug_run_submission_resolves_latest_published_version(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="slug-run-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="slug-run-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    first_version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+        version="1.0.0",
+    )
+
+    draft_response = client.post(
+        f"/api/v1/workflows/{workflow_id}/versions",
+        json=_workflow_version_payload(version="1.1.0"),
+        headers=owner,
+    )
+    assert draft_response.status_code == 201
+    draft_version_id = draft_response.json()["id"]
+
+    run_while_candidate_is_draft = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-200",
+                "customer_id": "C-300",
+                "message": "Where is my order?",
+            },
+        },
+        headers=owner,
+    )
+    assert run_while_candidate_is_draft.status_code == 201
+    assert run_while_candidate_is_draft.json()["workflow_version_id"] == first_version_id
+
+    publish_candidate_response = client.post(
+        f"/api/v1/workflow-versions/{draft_version_id}/publish",
+        json={"published_by": owner["X-Actor-User-Id"]},
+        headers=owner,
+    )
+    assert publish_candidate_response.status_code == 200
+
+    run_after_candidate_publish = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-201",
+                "customer_id": "C-301",
+                "message": "I need a refund.",
+            },
+        },
+        headers=owner,
+    )
+    assert run_after_candidate_publish.status_code == 201
+    assert run_after_candidate_publish.json()["workflow_version_id"] == draft_version_id
+
+    invalid_payload_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-202",
+                "customer_id": "C-302",
+            },
+        },
+        headers=owner,
+    )
+    assert invalid_payload_response.status_code == 400
+    assert invalid_payload_response.json()["detail"] == "input_payload: 'message' is a required property"
+
+    unknown_slug_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/missing-workflow/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-203",
+                "customer_id": "C-303",
+                "message": "This workflow does not exist.",
+            },
+        },
+        headers=owner,
+    )
+    assert unknown_slug_response.status_code == 404
+    assert unknown_slug_response.json()["detail"] == "workflow not found"
+
+
+def test_run_status_transitions_and_trace_span_writes(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="trace-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="trace-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+    )
+
+    run_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-300",
+                "customer_id": "C-400",
+                "message": "I was charged twice.",
+            },
+        },
+        headers=owner,
+    )
+    assert run_response.status_code == 201
+    run_id = run_response.json()["id"]
+
+    invalid_terminal_response = client.patch(
+        f"/api/v1/projects/{project_id}/runs/{run_id}/status",
+        json={"status": "succeeded", "final_output": {"summary": "too early"}},
+        headers=owner,
+    )
+    assert invalid_terminal_response.status_code == 409
+    assert invalid_terminal_response.json()["detail"] == "invalid run status transition: queued -> succeeded"
+
+    running_response = client.patch(
+        f"/api/v1/projects/{project_id}/runs/{run_id}/status",
+        json={"status": "running"},
+        headers=owner,
+    )
+    assert running_response.status_code == 200
+    running_body = running_response.json()
+    assert running_body["status"] == "running"
+    assert running_body["started_at"] is not None
+
+    span_payload = {
+        "trace_id": "0" * 32,
+        "span_id": "1" * 16,
+        "span_type": "run.start",
+        "name": "run.start",
+        "status": "in_progress",
+        "attributes": {"workflow_slug": "support-ticket-resolution"},
+    }
+    span_response = client.post(
+        f"/api/v1/projects/{project_id}/runs/{run_id}/trace-spans",
+        json=span_payload,
+        headers=owner,
+    )
+    assert span_response.status_code == 201
+    span_body = span_response.json()
+    assert span_body["workflow_version_id"] == version_id
+    assert span_body["attributes"] == {"workflow_slug": "support-ticket-resolution"}
+
+    duplicate_span_response = client.post(
+        f"/api/v1/projects/{project_id}/runs/{run_id}/trace-spans",
+        json=span_payload,
+        headers=owner,
+    )
+    assert duplicate_span_response.status_code == 409
+    assert duplicate_span_response.json()["detail"] == "trace span already exists"
+
+    spans_response = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}/trace-spans", headers=owner)
+    assert spans_response.status_code == 200
+    assert [record["span_id"] for record in spans_response.json()] == ["1" * 16]
+
+    succeeded_response = client.patch(
+        f"/api/v1/projects/{project_id}/runs/{run_id}/status",
+        json={
+            "status": "succeeded",
+            "final_output": {"summary": "Resolved duplicate charge.", "confidence": 0.93},
+            "tokens_input": 120,
+            "tokens_output": 64,
+        },
+        headers=owner,
+    )
+    assert succeeded_response.status_code == 200
+    succeeded_body = succeeded_response.json()
+    assert succeeded_body["status"] == "succeeded"
+    assert succeeded_body["ended_at"] is not None
+    assert succeeded_body["final_output"] == {"summary": "Resolved duplicate charge.", "confidence": 0.93}
+    assert succeeded_body["tokens_input"] == 120
+    assert succeeded_body["tokens_output"] == 64
+
+    rerun_response = client.patch(
+        f"/api/v1/projects/{project_id}/runs/{run_id}/status",
+        json={"status": "running"},
+        headers=owner,
+    )
+    assert rerun_response.status_code == 409
+    assert rerun_response.json()["detail"] == "invalid run status transition: succeeded -> running"
 
 
 def test_draft_versions_can_be_updated_but_only_valid_definitions_can_publish(client: TestClient) -> None:

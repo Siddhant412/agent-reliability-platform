@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from arp_core.contracts.run import RunRead
+from arp_core.contracts.run import RunRead, TraceSpanRead
 from arp_core.contracts.tenant import MembershipRead, OrganizationRead, ProjectRead
 from arp_core.contracts.workflow import (
     ModelConfig,
@@ -12,7 +12,7 @@ from arp_core.contracts.workflow import (
     WorkflowToolRef,
     WorkflowVersionRead,
 )
-from arp_core.persistence.models import Membership, Organization, Project, Run, Workflow, WorkflowVersion
+from arp_core.persistence.models import Membership, Organization, Project, Run, TraceSpan, Workflow, WorkflowVersion
 
 
 def organization_to_read(record: Organization) -> OrganizationRead:
@@ -72,5 +72,25 @@ def run_to_read(record: Run) -> RunRead:
         tokens_input=record.tokens_input,
         tokens_output=record.tokens_output,
         feedback_score=record.feedback_score,
+        created_at=record.created_at,
+    )
+
+
+def trace_span_to_read(record: TraceSpan) -> TraceSpanRead:
+    return TraceSpanRead(
+        id=record.id,
+        project_id=record.project_id,
+        workflow_version_id=record.workflow_version_id,
+        run_id=record.run_id,
+        trace_id=record.trace_id,
+        span_id=record.span_id,
+        parent_span_id=record.parent_span_id,
+        span_type=record.span_type,
+        name=record.name,
+        status=record.status,
+        started_at=record.started_at,
+        ended_at=record.ended_at,
+        attributes=record.attributes_json,
+        error=record.error_json,
         created_at=record.created_at,
     )
