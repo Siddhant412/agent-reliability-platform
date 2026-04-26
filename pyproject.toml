@@ -30,8 +30,13 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = [
   "apps/api/src/arp_api",
+  "apps/worker/src/arp_worker",
   "packages/backend-core/src/arp_core",
+  "packages/support-demo/src/arp_support_demo",
 ]
+
+[project.scripts]
+arp-worker-run = "arp_worker.main:main"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -46,6 +51,8 @@ include = [
 [tool.pytest.ini_options]
 pythonpath = [
   "apps/api/src",
+  "apps/worker/src",
   "packages/backend-core/src",
+  "packages/support-demo/src",
 ]
 testpaths = ["tests"]

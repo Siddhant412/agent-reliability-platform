@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from arp_core.domain.enums import RunStatus, SpanStatus
+from arp_core.domain.enums import RunStatus, SpanStatus, ToolCallStatus
 
 
 class RunSubmitRequest(BaseModel):
@@ -79,5 +79,36 @@ class TraceSpanRead(BaseModel):
     started_at: datetime
     ended_at: datetime | None = None
     attributes: dict[str, Any]
+    error: dict[str, Any] | None = None
+    created_at: datetime
+
+
+class ToolCallCreate(BaseModel):
+    tool_name: str = Field(min_length=1, max_length=120)
+    args: dict[str, Any]
+    span_id: str | None = Field(default=None, min_length=1, max_length=16)
+    approval_required: bool = False
+
+
+class ToolCallUpdate(BaseModel):
+    status: ToolCallStatus
+    span_id: str | None = Field(default=None, min_length=1, max_length=16)
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+
+class ToolCallRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    project_id: UUID
+    run_id: UUID
+    span_id: str | None = None
+    tool_name: str
+    args: dict[str, Any]
+    status: ToolCallStatus
+    approval_required: bool
+    approval_id: UUID | None = None
+    result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     created_at: datetime

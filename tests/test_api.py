@@ -430,6 +430,10 @@ def test_run_status_transitions_and_trace_span_writes(client: TestClient) -> Non
     assert spans_response.status_code == 200
     assert [record["span_id"] for record in spans_response.json()] == ["1" * 16]
 
+    tool_calls_response = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}/tool-calls", headers=owner)
+    assert tool_calls_response.status_code == 200
+    assert tool_calls_response.json() == []
+
     succeeded_response = client.patch(
         f"/api/v1/projects/{project_id}/runs/{run_id}/status",
         json={

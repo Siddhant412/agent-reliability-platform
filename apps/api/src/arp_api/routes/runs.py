@@ -15,11 +15,12 @@ from arp_core.contracts.run import (
     RunRead,
     RunSubmitRequest,
     RunTransitionRequest,
+    ToolCallRead,
     TraceSpanCreate,
     TraceSpanRead,
     WorkflowRunSubmitRequest,
 )
-from arp_core.contracts.serializers import run_to_read, trace_span_to_read
+from arp_core.contracts.serializers import run_to_read, tool_call_to_read, trace_span_to_read
 
 
 router = APIRouter(tags=["runs"])
@@ -108,6 +109,19 @@ def create_trace_span(
 ) -> TraceSpanRead:
     span = services.create_trace_span(session, project_id=project_id, run_id=run_id, payload=payload)
     return trace_span_to_read(span)
+
+
+@router.get("/api/v1/projects/{project_id}/runs/{run_id}/tool-calls", response_model=list[ToolCallRead])
+def list_tool_calls(
+    project_id: UUID,
+    run_id: UUID,
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    session: Annotated[Session, Depends(get_db_session)],
+) -> list[ToolCallRead]:
+    return [
+        tool_call_to_read(record)
+        for record in services.list_tool_calls(session, project_id=project_id, run_id=run_id)
+    ]
 
 
 @router.get("/api/v1/projects/{project_id}/runs/{run_id}", response_model=RunRead)

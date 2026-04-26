@@ -11,7 +11,14 @@ from sqlalchemy.orm import Session, joinedload
 from arp_core.application.audit import record_audit_event
 from arp_core.application.exceptions import ApplicationError, ConflictError, NotFoundError
 from arp_core.application.auth import AuthenticatedActor
-from arp_core.contracts.run import RunSubmitRequest, RunTransitionRequest, TraceSpanCreate, WorkflowRunSubmitRequest
+from arp_core.contracts.run import (
+    RunSubmitRequest,
+    RunTransitionRequest,
+    ToolCallCreate,
+    ToolCallUpdate,
+    TraceSpanCreate,
+    WorkflowRunSubmitRequest,
+)
 from arp_core.contracts.tenant import MembershipCreate, OrganizationCreate, ProjectCreate
 from arp_core.contracts.workflow import (
     PublishWorkflowVersionRequest,
@@ -19,9 +26,9 @@ from arp_core.contracts.workflow import (
     WorkflowVersionCreate,
     WorkflowVersionUpdate,
 )
-from arp_core.domain.enums import MembershipRole, RunStatus, WorkflowVersionStatus
+from arp_core.domain.enums import MembershipRole, RunStatus, ToolCallStatus, WorkflowVersionStatus
 from arp_core.persistence.base import utcnow
-from arp_core.persistence.models import Membership, Organization, Project, Run, TraceSpan, Workflow, WorkflowVersion
+from arp_core.persistence.models import Membership, Organization, Project, Run, ToolCall, TraceSpan, Workflow, WorkflowVersion
 from arp_core.workflow_registry.validation import build_workflow_definition_document, validate_workflow_definition
 
 
@@ -64,6 +71,7 @@ def _validate_run_input_payload(*, input_schema: dict, input_payload: dict) -> N
 
 
 TERMINAL_RUN_STATUSES = {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}
+ACTIVE_RUN_STATUSES = {RunStatus.RUNNING, RunStatus.AWAITING_APPROVAL, RunStatus.RESUMED}
 ALLOWED_RUN_STATUS_TRANSITIONS = {
     RunStatus.QUEUED: {RunStatus.RUNNING, RunStatus.CANCELLED},
     RunStatus.RUNNING: {
@@ -78,6 +86,25 @@ ALLOWED_RUN_STATUS_TRANSITIONS = {
     RunStatus.FAILED: set(),
     RunStatus.CANCELLED: set(),
 }
+TERMINAL_TOOL_CALL_STATUSES = {
+    ToolCallStatus.BLOCKED,
+    ToolCallStatus.EXECUTED,
+    ToolCallStatus.REJECTED,
+    ToolCallStatus.FAILED,
+}
+ALLOWED_TOOL_CALL_STATUS_TRANSITIONS = {
+    ToolCallStatus.PROPOSED: {
+        ToolCallStatus.APPROVED,
+        ToolCallStatus.BLOCKED,
+        ToolCallStatus.EXECUTED,
+        ToolCallStatus.FAILED,
+    },
+    ToolCallStatus.APPROVED: {ToolCallStatus.EXECUTED, ToolCallStatus.FAILED, ToolCallStatus.REJECTED},
+    ToolCallStatus.BLOCKED: set(),
+    ToolCallStatus.EXECUTED: set(),
+    ToolCallStatus.REJECTED: set(),
+    ToolCallStatus.FAILED: set(),
+}
 
 
 def _ensure_run_transition_allowed(*, current_status: RunStatus, next_status: RunStatus) -> None:
@@ -85,6 +112,13 @@ def _ensure_run_transition_allowed(*, current_status: RunStatus, next_status: Ru
         return
     if next_status not in ALLOWED_RUN_STATUS_TRANSITIONS[current_status]:
         raise ConflictError(f"invalid run status transition: {current_status.value} -> {next_status.value}")
+
+
+def _ensure_tool_call_transition_allowed(*, current_status: ToolCallStatus, next_status: ToolCallStatus) -> None:
+    if current_status == next_status:
+        return
+    if next_status not in ALLOWED_TOOL_CALL_STATUS_TRANSITIONS[current_status]:
+        raise ConflictError(f"invalid tool call status transition: {current_status.value} -> {next_status.value}")
 
 
 def _latency_ms_between(started_at: datetime, ended_at: datetime) -> int:
@@ -788,3 +822,74 @@ def create_trace_span(
     session.add(span)
     session.flush()
     return span
+
+
+def list_tool_calls(session: Session, *, project_id: UUID, run_id: UUID) -> list[ToolCall]:
+    get_run(session, project_id=project_id, run_id=run_id)
+    return list(
+        session.scalars(
+            select(ToolCall)
+            .where(ToolCall.project_id == project_id, ToolCall.run_id == run_id)
+            .order_by(ToolCall.created_at)
+        ).all()
+    )
+
+
+def create_tool_call(
+    session: Session,
+    *,
+    project_id: UUID,
+    run_id: UUID,
+    payload: ToolCallCreate,
+) -> ToolCall:
+    run = get_run(session, project_id=project_id, run_id=run_id)
+    if run.status not in ACTIVE_RUN_STATUSES:
+        raise ConflictError("tool calls can only be recorded while a run is active")
+
+    tool_call = ToolCall(
+        project_id=project_id,
+        run_id=run_id,
+        span_id=payload.span_id,
+        tool_name=payload.tool_name,
+        args_json=payload.args,
+        status=ToolCallStatus.PROPOSED,
+        approval_required=payload.approval_required,
+        result_json=None,
+        error_json=None,
+    )
+    session.add(tool_call)
+    session.flush()
+    return tool_call
+
+
+def update_tool_call(
+    session: Session,
+    *,
+    project_id: UUID,
+    tool_call_id: UUID,
+    payload: ToolCallUpdate,
+) -> ToolCall:
+    tool_call = _first_or_404(
+        session,
+        select(ToolCall).where(ToolCall.project_id == project_id, ToolCall.id == tool_call_id),
+        "tool call not found",
+    )
+    _ensure_tool_call_transition_allowed(current_status=tool_call.status, next_status=payload.status)
+    if payload.result is not None and payload.status != ToolCallStatus.EXECUTED:
+        raise ConflictError("tool call result can only be set when status is executed")
+    if payload.error is not None and payload.status != ToolCallStatus.FAILED:
+        raise ConflictError("tool call error can only be set when status is failed")
+
+    tool_call.status = payload.status
+    if payload.span_id is not None:
+        tool_call.span_id = payload.span_id
+    if payload.status == ToolCallStatus.EXECUTED:
+        tool_call.result_json = payload.result or {}
+        tool_call.error_json = None
+    if payload.status == ToolCallStatus.FAILED:
+        tool_call.error_json = payload.error or {}
+    if payload.status in TERMINAL_TOOL_CALL_STATUSES and payload.status != ToolCallStatus.FAILED:
+        tool_call.error_json = None
+
+    session.flush()
+    return tool_call
