@@ -188,3 +188,9 @@ def ensure_project_can_write_workflows(access: ProjectAccess) -> None:
 def ensure_project_can_access_runs(access: ProjectAccess) -> None:
     if not access.has_any_role(RUN_ACCESS_ROLES):
         raise AuthorizationError("actor is not allowed to access runs in this project")
+
+
+def ensure_project_can_decide_approval(access: ProjectAccess, *, approver_role: MembershipRole) -> None:
+    if access.has_any_role(PROJECT_ADMIN_ROLES | {approver_role}):
+        return
+    raise AuthorizationError("actor is not allowed to decide this approval request")

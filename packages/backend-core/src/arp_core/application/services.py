@@ -5,7 +5,7 @@ from uuid import UUID
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError as JSONSchemaValidationError
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from arp_core.application.audit import record_audit_event
@@ -26,9 +26,19 @@ from arp_core.contracts.workflow import (
     WorkflowVersionCreate,
     WorkflowVersionUpdate,
 )
-from arp_core.domain.enums import MembershipRole, RunStatus, ToolCallStatus, WorkflowVersionStatus
+from arp_core.domain.enums import ApprovalStatus, MembershipRole, RunStatus, ToolCallStatus, WorkflowVersionStatus
 from arp_core.persistence.base import utcnow
-from arp_core.persistence.models import Membership, Organization, Project, Run, ToolCall, TraceSpan, Workflow, WorkflowVersion
+from arp_core.persistence.models import (
+    ApprovalRequest,
+    Membership,
+    Organization,
+    Project,
+    Run,
+    ToolCall,
+    TraceSpan,
+    Workflow,
+    WorkflowVersion,
+)
 from arp_core.workflow_registry.validation import build_workflow_definition_document, validate_workflow_definition
 
 
@@ -97,6 +107,7 @@ ALLOWED_TOOL_CALL_STATUS_TRANSITIONS = {
         ToolCallStatus.APPROVED,
         ToolCallStatus.BLOCKED,
         ToolCallStatus.EXECUTED,
+        ToolCallStatus.REJECTED,
         ToolCallStatus.FAILED,
     },
     ToolCallStatus.APPROVED: {ToolCallStatus.EXECUTED, ToolCallStatus.FAILED, ToolCallStatus.REJECTED},
@@ -893,3 +904,166 @@ def update_tool_call(
 
     session.flush()
     return tool_call
+
+
+def list_approval_requests(
+    session: Session,
+    *,
+    project_id: UUID,
+    status: ApprovalStatus | None = None,
+) -> list[ApprovalRequest]:
+    statement = select(ApprovalRequest).where(ApprovalRequest.project_id == project_id)
+    if status is not None:
+        statement = statement.where(ApprovalRequest.status == status)
+    return list(session.scalars(statement.order_by(ApprovalRequest.requested_at.desc())).all())
+
+
+def get_approval_request(session: Session, *, project_id: UUID, approval_id: UUID) -> ApprovalRequest:
+    return _first_or_404(
+        session,
+        select(ApprovalRequest).where(
+            ApprovalRequest.project_id == project_id,
+            ApprovalRequest.id == approval_id,
+        ),
+        "approval request not found",
+    )
+
+
+def create_approval_request(
+    session: Session,
+    *,
+    project_id: UUID,
+    run_id: UUID,
+    tool_call_id: UUID,
+    approver_role: MembershipRole,
+    reason: str,
+    run_context: dict | None,
+    proposed_effect: dict | None,
+) -> ApprovalRequest:
+    run = get_run(session, project_id=project_id, run_id=run_id)
+    tool_call = _first_or_404(
+        session,
+        select(ToolCall).where(
+            ToolCall.project_id == project_id,
+            ToolCall.run_id == run_id,
+            ToolCall.id == tool_call_id,
+        ),
+        "tool call not found",
+    )
+    if tool_call.status != ToolCallStatus.PROPOSED:
+        raise ConflictError("approval requests can only be created for proposed tool calls")
+
+    existing = session.scalar(select(ApprovalRequest).where(ApprovalRequest.tool_call_id == tool_call_id))
+    if existing is not None:
+        raise ConflictError("approval request already exists for this tool call")
+
+    approval = ApprovalRequest(
+        project_id=project_id,
+        run_id=run_id,
+        tool_call_id=tool_call_id,
+        approver_role=approver_role,
+        status=ApprovalStatus.PENDING,
+        reason=reason,
+        run_context_json=run_context,
+        proposed_effect_json=proposed_effect,
+    )
+    session.add(approval)
+    session.flush()
+
+    tool_call.approval_required = True
+    tool_call.approval_id = approval.id
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=run.triggered_by,
+        org_id=run.workflow_version.workflow.project.org_id,
+        project_id=project_id,
+        action="approval.request",
+        resource_type="approval_request",
+        resource_id=approval.id,
+        before_json=None,
+        after_json={
+            "run_id": str(run_id),
+            "tool_call_id": str(tool_call_id),
+            "tool_name": tool_call.tool_name,
+            "approver_role": approver_role.value,
+            "status": approval.status.value,
+        },
+    )
+    return approval
+
+
+def decide_approval_request(
+    session: Session,
+    *,
+    project_id: UUID,
+    approval_id: UUID,
+    status: ApprovalStatus,
+    decided_by: UUID,
+    decision_note: str | None,
+) -> ApprovalRequest:
+    if status not in {ApprovalStatus.APPROVED, ApprovalStatus.REJECTED}:
+        raise ConflictError("approval decision must be approved or rejected")
+
+    approval = _first_or_404(
+        session,
+        select(ApprovalRequest)
+        .options(joinedload(ApprovalRequest.tool_call))
+        .where(ApprovalRequest.project_id == project_id, ApprovalRequest.id == approval_id),
+        "approval request not found",
+    )
+    if approval.status != ApprovalStatus.PENDING:
+        raise ConflictError("approval request has already been decided")
+
+    before_json = {
+        "status": approval.status.value,
+        "decided_by": str(approval.decided_by) if approval.decided_by else None,
+    }
+    approval.status = status
+    approval.decided_at = utcnow()
+    approval.decided_by = decided_by
+    approval.decision_note = decision_note
+
+    tool_call_status = ToolCallStatus.APPROVED if status == ApprovalStatus.APPROVED else ToolCallStatus.REJECTED
+    update_tool_call(
+        session,
+        project_id=project_id,
+        tool_call_id=approval.tool_call_id,
+        payload=ToolCallUpdate(status=tool_call_status),
+    )
+
+    run = get_run(session, project_id=project_id, run_id=approval.run_id)
+    pending_count = session.scalar(
+        select(func.count())
+        .select_from(ApprovalRequest)
+        .where(
+            ApprovalRequest.project_id == project_id,
+            ApprovalRequest.run_id == approval.run_id,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+    ) or 0
+    if pending_count == 0 and run.status == RunStatus.AWAITING_APPROVAL:
+        transition_run_status(
+            session,
+            project_id=project_id,
+            run_id=approval.run_id,
+            payload=RunTransitionRequest(status=RunStatus.RESUMED),
+        )
+
+    record_audit_event(
+        session,
+        actor_user_id=decided_by,
+        org_id=run.workflow_version.workflow.project.org_id,
+        project_id=project_id,
+        action=f"approval.{status.value}",
+        resource_type="approval_request",
+        resource_id=approval.id,
+        before_json=before_json,
+        after_json={
+            "status": approval.status.value,
+            "decided_by": str(decided_by),
+            "tool_call_id": str(approval.tool_call_id),
+        },
+    )
+    return approval

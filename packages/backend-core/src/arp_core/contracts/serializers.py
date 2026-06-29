@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from arp_core.contracts.approval import ApprovalRequestRead
 from arp_core.contracts.run import RunRead, ToolCallRead, TraceSpanRead
 from arp_core.contracts.tenant import MembershipRead, OrganizationRead, ProjectRead
 from arp_core.contracts.workflow import (
@@ -12,7 +13,17 @@ from arp_core.contracts.workflow import (
     WorkflowToolRef,
     WorkflowVersionRead,
 )
-from arp_core.persistence.models import Membership, Organization, Project, Run, ToolCall, TraceSpan, Workflow, WorkflowVersion
+from arp_core.persistence.models import (
+    ApprovalRequest,
+    Membership,
+    Organization,
+    Project,
+    Run,
+    ToolCall,
+    TraceSpan,
+    Workflow,
+    WorkflowVersion,
+)
 
 
 def organization_to_read(record: Organization) -> OrganizationRead:
@@ -110,4 +121,22 @@ def tool_call_to_read(record: ToolCall) -> ToolCallRead:
         result=record.result_json,
         error=record.error_json,
         created_at=record.created_at,
+    )
+
+
+def approval_request_to_read(record: ApprovalRequest) -> ApprovalRequestRead:
+    return ApprovalRequestRead(
+        id=record.id,
+        project_id=record.project_id,
+        run_id=record.run_id,
+        tool_call_id=record.tool_call_id,
+        approver_role=record.approver_role,
+        status=record.status,
+        reason=record.reason,
+        run_context=record.run_context_json,
+        proposed_effect=record.proposed_effect_json,
+        requested_at=record.requested_at,
+        decided_at=record.decided_at,
+        decided_by=record.decided_by,
+        decision_note=record.decision_note,
     )

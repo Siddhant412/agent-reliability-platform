@@ -35,6 +35,24 @@ TOOL_METADATA: dict[str, SupportToolMetadata] = {
         is_mutating=False,
         risk_level="low",
     ),
+    "issue_refund": SupportToolMetadata(
+        name="issue_refund",
+        description="Issue a refund against an order.",
+        is_mutating=True,
+        risk_level="high",
+    ),
+    "post_ticket_comment": SupportToolMetadata(
+        name="post_ticket_comment",
+        description="Post an internal comment on a support ticket.",
+        is_mutating=True,
+        risk_level="medium",
+    ),
+    "send_customer_email": SupportToolMetadata(
+        name="send_customer_email",
+        description="Send an email reply to a customer.",
+        is_mutating=True,
+        risk_level="high",
+    ),
 }
 
 
@@ -140,6 +158,53 @@ def get_order(*, customer_id: str | None = None, order_id: str | None = None) ->
     return {"customer_id": customer_id, "status": "not_found"}
 
 
+def issue_refund(*, order_id: str, amount: float, reason: str, idempotency_key: str) -> dict[str, Any]:
+    if amount <= 0:
+        raise SupportToolError("refund amount must be greater than zero")
+    order = ORDERS.get(order_id)
+    if order is None:
+        raise SupportToolError(f"order not found: {order_id}")
+    if amount > float(order["total_usd"]):
+        raise SupportToolError("refund amount cannot exceed order total")
+    return {
+        "refund_id": f"RF-{idempotency_key[-8:]}",
+        "order_id": order_id,
+        "amount": amount,
+        "currency": "USD",
+        "reason": reason,
+        "status": "issued",
+        "idempotency_key": idempotency_key,
+    }
+
+
+def post_ticket_comment(*, ticket_id: str, body: str, idempotency_key: str) -> dict[str, Any]:
+    if not ticket_id:
+        raise SupportToolError("ticket_id is required")
+    return {
+        "comment_id": f"CM-{idempotency_key[-8:]}",
+        "ticket_id": ticket_id,
+        "body": body,
+        "status": "posted",
+        "idempotency_key": idempotency_key,
+    }
+
+
+def send_customer_email(*, customer_id: str, subject: str, body: str, idempotency_key: str) -> dict[str, Any]:
+    customer = get_customer_profile(customer_id=customer_id)
+    email = customer.get("email")
+    if email is None:
+        raise SupportToolError(f"customer email not found: {customer_id}")
+    return {
+        "email_id": f"EM-{idempotency_key[-8:]}",
+        "customer_id": customer_id,
+        "to": email,
+        "subject": subject,
+        "body": body,
+        "status": "sent",
+        "idempotency_key": idempotency_key,
+    }
+
+
 def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "kb_search":
         return kb_search(query=str(args.get("query", "")))
@@ -150,5 +215,24 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             customer_id=args.get("customer_id"),
             order_id=args.get("order_id"),
         )
+    if name == "issue_refund":
+        return issue_refund(
+            order_id=str(args.get("order_id", "")),
+            amount=float(args.get("amount", 0)),
+            reason=str(args.get("reason", "")),
+            idempotency_key=str(args.get("idempotency_key", "")),
+        )
+    if name == "post_ticket_comment":
+        return post_ticket_comment(
+            ticket_id=str(args.get("ticket_id", "")),
+            body=str(args.get("body", "")),
+            idempotency_key=str(args.get("idempotency_key", "")),
+        )
+    if name == "send_customer_email":
+        return send_customer_email(
+            customer_id=str(args.get("customer_id", "")),
+            subject=str(args.get("subject", "")),
+            body=str(args.get("body", "")),
+            idempotency_key=str(args.get("idempotency_key", "")),
+        )
     raise SupportToolError(f"unknown support demo tool: {name}")
-

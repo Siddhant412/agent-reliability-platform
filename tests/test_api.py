@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from uuid import UUID
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+
+from arp_worker.runner import execute_run
 
 
 def _workflow_version_payload(*, version: str = "1.0.0") -> dict:
@@ -459,6 +462,71 @@ def test_run_status_transitions_and_trace_span_writes(client: TestClient) -> Non
     )
     assert rerun_response.status_code == 409
     assert rerun_response.json()["detail"] == "invalid run status transition: succeeded -> running"
+
+
+def test_approval_routes_allow_required_approver_to_decide(client: TestClient) -> None:
+    owner = _headers()
+    supervisor = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="approval-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="approval-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+    )
+    membership_response = client.post(
+        f"/api/v1/projects/{project_id}/memberships",
+        json={"user_id": supervisor["X-Actor-User-Id"], "role": "supervisor"},
+        headers=owner,
+    )
+    assert membership_response.status_code == 201
+
+    run_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-500",
+                "customer_id": "C-500",
+                "message": "I was charged twice and need a refund.",
+            },
+        },
+        headers=owner,
+    )
+    assert run_response.status_code == 201
+    run_id = run_response.json()["id"]
+
+    with client.app.state.session_manager.session() as session:
+        result = execute_run(session, project_id=UUID(project_id), run_id=UUID(run_id))
+        session.commit()
+    assert result.status.value == "awaiting_approval"
+
+    approvals_response = client.get(
+        f"/api/v1/projects/{project_id}/approvals",
+        params={"status": "pending"},
+        headers=owner,
+    )
+    assert approvals_response.status_code == 200
+    approvals = approvals_response.json()
+    assert len(approvals) == 1
+    approval = approvals[0]
+    assert approval["approver_role"] == "supervisor"
+    assert approval["proposed_effect"]["tool_name"] == "issue_refund"
+
+    decided_response = client.post(
+        f"/api/v1/projects/{project_id}/approvals/{approval['id']}/decide",
+        json={"status": "approved", "decision_note": "Duplicate charge confirmed."},
+        headers=supervisor,
+    )
+    assert decided_response.status_code == 200
+    decided = decided_response.json()
+    assert decided["status"] == "approved"
+    assert decided["decided_by"] == supervisor["X-Actor-User-Id"]
+
+    run_after_decision = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}", headers=owner)
+    assert run_after_decision.status_code == 200
+    assert run_after_decision.json()["status"] == "resumed"
 
 
 def test_draft_versions_can_be_updated_but_only_valid_definitions_can_publish(client: TestClient) -> None:
