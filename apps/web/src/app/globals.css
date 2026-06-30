@@ -129,7 +129,7 @@ code {
   border-bottom: 1px solid var(--line);
   display: grid;
   gap: 10px;
-  grid-template-columns: minmax(260px, 1.1fr) minmax(260px, 1.1fr) minmax(220px, 0.8fr) repeat(3, max-content);
+  grid-template-columns: minmax(260px, 1.1fr) minmax(260px, 1.1fr) minmax(220px, 0.8fr) repeat(4, max-content);
   padding: 12px 22px;
 }
 
@@ -192,6 +192,7 @@ code {
 .runList,
 .approvalList,
 .toolList,
+.evalList,
 .callList,
 .timeline {
   display: grid;
@@ -297,6 +298,7 @@ code {
 .spanTitle,
 .approvalTitle,
 .callTitle,
+.evalTitle,
 .connectorTitle,
 .toolRow {
   align-items: center;
@@ -311,12 +313,14 @@ code {
 
 .spanTitle span,
 .callTitle strong,
+.evalTitle strong,
 .connectorTitle strong {
   font-size: 13px;
 }
 
 .approvalRow,
 .connectorRow,
+.evalRow,
 .callRow {
   border-bottom: 1px solid var(--line);
   display: grid;
@@ -348,6 +352,16 @@ code {
   grid-template-columns: 1fr 70px 18px;
   min-height: 34px;
   padding-top: 8px;
+}
+
+.evalTitle {
+  justify-content: space-between;
+}
+
+.evalSummary {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .detailGrid {

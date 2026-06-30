@@ -707,6 +707,83 @@ def test_execute_endpoint_completes_rejected_approval_as_escalated(client: TestC
     assert refund_call["result"] is None
 
 
+def test_eval_run_executes_dataset_and_records_case_results(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="eval-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="eval-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+    )
+
+    dataset_response = client.post(
+        f"/api/v1/projects/{project_id}/datasets",
+        json={"name": "support-smoke", "version": "1.0.0", "description": "Core support evals."},
+        headers=owner,
+    )
+    assert dataset_response.status_code == 201
+    dataset_id = dataset_response.json()["id"]
+
+    valid_case_response = client.post(
+        f"/api/v1/projects/{project_id}/datasets/{dataset_id}/cases",
+        json={
+            "input_payload": {
+                "ticket_id": "E-100",
+                "customer_id": "C-200",
+                "message": "Where is my order?",
+            },
+            "expected": {"disposition": "resolved"},
+            "tags": ["smoke", "order"],
+        },
+        headers=owner,
+    )
+    assert valid_case_response.status_code == 201
+
+    invalid_case_response = client.post(
+        f"/api/v1/projects/{project_id}/datasets/{dataset_id}/cases",
+        json={
+            "input_payload": {
+                "ticket_id": "E-101",
+                "customer_id": "C-201",
+            },
+            "expected": {"disposition": "invalid"},
+            "tags": ["schema"],
+        },
+        headers=owner,
+    )
+    assert invalid_case_response.status_code == 201
+
+    create_eval_response = client.post(
+        f"/api/v1/projects/{project_id}/eval-runs",
+        json={"dataset_id": dataset_id, "workflow_version_id": version_id},
+        headers=owner,
+    )
+    assert create_eval_response.status_code == 201
+    eval_run_id = create_eval_response.json()["id"]
+
+    execute_response = client.post(f"/api/v1/projects/{project_id}/eval-runs/{eval_run_id}/execute", headers=owner)
+    assert execute_response.status_code == 200
+    executed = execute_response.json()
+    assert executed["status"] == "succeeded"
+    assert executed["summary"]["total_cases"] == 2
+    assert executed["summary"]["succeeded"] == 1
+    assert executed["summary"]["failed"] == 1
+    assert executed["summary"]["schema_valid"] == 1
+    assert executed["summary"]["success_rate"] == 0.5
+
+    results_response = client.get(f"/api/v1/projects/{project_id}/eval-runs/{eval_run_id}/results", headers=owner)
+    assert results_response.status_code == 200
+    results = results_response.json()
+    assert len(results) == 2
+    assert {record["status"] for record in results} == {"succeeded", "failed"}
+    assert next(record for record in results if record["status"] == "succeeded")["run_id"] is not None
+    failed_result = next(record for record in results if record["status"] == "failed" and record["run_id"] is None)
+    assert "message" in failed_result["error"]
+
+
 def test_draft_versions_can_be_updated_but_only_valid_definitions_can_publish(client: TestClient) -> None:
     owner = _headers()
 

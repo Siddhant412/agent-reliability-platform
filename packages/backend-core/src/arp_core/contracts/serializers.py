@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from arp_core.contracts.approval import ApprovalRequestRead
+from arp_core.contracts.eval import DatasetRead, EvalCaseRead, EvalCaseResultRead, EvalRunRead
 from arp_core.contracts.run import RunRead, ToolCallRead, TraceSpanRead
 from arp_core.contracts.tenant import MembershipRead, OrganizationRead, ProjectRead
 from arp_core.contracts.tooling import ConnectorRead, ToolDefinitionRead
@@ -17,6 +18,10 @@ from arp_core.contracts.workflow import (
 from arp_core.persistence.models import (
     ApprovalRequest,
     Connector,
+    Dataset,
+    EvalCase,
+    EvalCaseResult,
+    EvalRun,
     Membership,
     Organization,
     Project,
@@ -170,5 +175,57 @@ def tool_definition_to_read(record: ToolDefinition) -> ToolDefinitionRead:
         input_schema=record.input_schema_json,
         output_schema=record.output_schema_json,
         is_mutating=record.is_mutating,
+        created_at=record.created_at,
+    )
+
+
+def dataset_to_read(record: Dataset) -> DatasetRead:
+    return DatasetRead(
+        id=record.id,
+        project_id=record.project_id,
+        name=record.name,
+        version=record.version,
+        description=record.description,
+        created_by=record.created_by,
+        created_at=record.created_at,
+    )
+
+
+def eval_case_to_read(record: EvalCase) -> EvalCaseRead:
+    return EvalCaseRead(
+        id=record.id,
+        dataset_id=record.dataset_id,
+        input_payload=record.input_json,
+        expected=record.expected_json,
+        tags=record.tags_json,
+        created_at=record.created_at,
+    )
+
+
+def eval_run_to_read(record: EvalRun) -> EvalRunRead:
+    return EvalRunRead(
+        id=record.id,
+        dataset_id=record.dataset_id,
+        workflow_version_id=record.workflow_version_id,
+        baseline_version_id=record.baseline_version_id,
+        status=record.status,
+        summary=record.summary_json,
+        started_at=record.started_at,
+        ended_at=record.ended_at,
+        created_at=record.created_at,
+    )
+
+
+def eval_case_result_to_read(record: EvalCaseResult) -> EvalCaseResultRead:
+    return EvalCaseResultRead(
+        id=record.id,
+        eval_run_id=record.eval_run_id,
+        eval_case_id=record.eval_case_id,
+        run_id=record.run_id,
+        status=record.status,
+        scores=record.scores_json,
+        output=record.output_json,
+        trace_grade=record.trace_grade_json,
+        error=record.error_json,
         created_at=record.created_at,
     )

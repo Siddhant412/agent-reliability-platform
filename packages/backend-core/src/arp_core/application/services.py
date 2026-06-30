@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from arp_core.application.audit import record_audit_event
 from arp_core.application.exceptions import ApplicationError, ConflictError, NotFoundError
 from arp_core.application.auth import AuthenticatedActor
+from arp_core.contracts.eval import DatasetCreate, EvalCaseCreate, EvalRunCreate
 from arp_core.contracts.run import (
     RunSubmitRequest,
     RunTransitionRequest,
@@ -28,11 +29,24 @@ from arp_core.contracts.workflow import (
     WorkflowVersionCreate,
     WorkflowVersionUpdate,
 )
-from arp_core.domain.enums import ApprovalStatus, MembershipRole, RunStatus, SpanStatus, ToolCallStatus, WorkflowVersionStatus
+from arp_core.domain.enums import (
+    ApprovalStatus,
+    EvalCaseStatus,
+    EvalRunStatus,
+    MembershipRole,
+    RunStatus,
+    SpanStatus,
+    ToolCallStatus,
+    WorkflowVersionStatus,
+)
 from arp_core.persistence.base import utcnow
 from arp_core.persistence.models import (
     ApprovalRequest,
     Connector,
+    Dataset,
+    EvalCase,
+    EvalCaseResult,
+    EvalRun,
     Membership,
     Organization,
     Project,
@@ -560,6 +574,255 @@ def create_tool_definition(
         },
     )
     return tool
+
+
+def list_datasets(session: Session, *, project_id: UUID) -> list[Dataset]:
+    return list(
+        session.scalars(
+            select(Dataset)
+            .where(Dataset.project_id == project_id)
+            .order_by(Dataset.created_at.desc())
+        ).all()
+    )
+
+
+def get_dataset(session: Session, *, project_id: UUID, dataset_id: UUID) -> Dataset:
+    return _first_or_404(
+        session,
+        select(Dataset).where(Dataset.project_id == project_id, Dataset.id == dataset_id),
+        "dataset not found",
+    )
+
+
+def create_dataset(
+    session: Session,
+    *,
+    project_id: UUID,
+    payload: DatasetCreate,
+    actor_user_id: UUID | None,
+) -> Dataset:
+    project = _first_or_404(session, select(Project).where(Project.id == project_id), "project not found")
+    existing = session.scalar(
+        select(Dataset).where(
+            Dataset.project_id == project_id,
+            Dataset.name == payload.name,
+            Dataset.version == payload.version,
+        )
+    )
+    if existing is not None:
+        raise ConflictError("dataset name and version already exist in this project")
+
+    dataset = Dataset(
+        project_id=project_id,
+        name=payload.name,
+        version=payload.version,
+        description=payload.description,
+        created_by=actor_user_id,
+    )
+    session.add(dataset)
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=project.org_id,
+        project_id=project_id,
+        action="dataset.create",
+        resource_type="dataset",
+        resource_id=dataset.id,
+        before_json=None,
+        after_json={"name": dataset.name, "version": dataset.version},
+    )
+    return dataset
+
+
+def list_eval_cases(session: Session, *, project_id: UUID, dataset_id: UUID) -> list[EvalCase]:
+    get_dataset(session, project_id=project_id, dataset_id=dataset_id)
+    return list(
+        session.scalars(
+            select(EvalCase)
+            .where(EvalCase.dataset_id == dataset_id)
+            .order_by(EvalCase.created_at)
+        ).all()
+    )
+
+
+def create_eval_case(
+    session: Session,
+    *,
+    project_id: UUID,
+    dataset_id: UUID,
+    payload: EvalCaseCreate,
+) -> EvalCase:
+    get_dataset(session, project_id=project_id, dataset_id=dataset_id)
+    eval_case = EvalCase(
+        dataset_id=dataset_id,
+        input_json=payload.input_payload,
+        expected_json=payload.expected,
+        tags_json=list(payload.tags),
+    )
+    session.add(eval_case)
+    session.flush()
+    return eval_case
+
+
+def list_eval_runs(session: Session, *, project_id: UUID) -> list[EvalRun]:
+    return list(
+        session.scalars(
+            select(EvalRun)
+            .join(Dataset, Dataset.id == EvalRun.dataset_id)
+            .where(Dataset.project_id == project_id)
+            .order_by(EvalRun.created_at.desc())
+        ).all()
+    )
+
+
+def get_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -> EvalRun:
+    return _first_or_404(
+        session,
+        select(EvalRun)
+        .join(Dataset, Dataset.id == EvalRun.dataset_id)
+        .where(Dataset.project_id == project_id, EvalRun.id == eval_run_id),
+        "eval run not found",
+    )
+
+
+def create_eval_run(
+    session: Session,
+    *,
+    project_id: UUID,
+    payload: EvalRunCreate,
+    actor_user_id: UUID | None,
+) -> EvalRun:
+    dataset = get_dataset(session, project_id=project_id, dataset_id=payload.dataset_id)
+    version = _first_or_404(
+        session,
+        select(WorkflowVersion).options(joinedload(WorkflowVersion.workflow)).where(
+            WorkflowVersion.id == payload.workflow_version_id,
+        ),
+        "workflow version not found",
+    )
+    if version.workflow.project_id != project_id:
+        raise ConflictError("workflow version does not belong to the requested project")
+    if version.status != WorkflowVersionStatus.PUBLISHED:
+        raise ConflictError("eval runs require a published workflow version")
+
+    if payload.baseline_version_id is not None:
+        baseline = _first_or_404(
+            session,
+            select(WorkflowVersion).options(joinedload(WorkflowVersion.workflow)).where(
+                WorkflowVersion.id == payload.baseline_version_id,
+            ),
+            "baseline workflow version not found",
+        )
+        if baseline.workflow.project_id != project_id:
+            raise ConflictError("baseline version does not belong to the requested project")
+
+    eval_run = EvalRun(
+        dataset_id=dataset.id,
+        workflow_version_id=version.id,
+        baseline_version_id=payload.baseline_version_id,
+        status=EvalRunStatus.QUEUED,
+        summary_json={},
+        started_at=None,
+        ended_at=None,
+    )
+    session.add(eval_run)
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=version.workflow.project.org_id,
+        project_id=project_id,
+        action="eval_run.create",
+        resource_type="eval_run",
+        resource_id=eval_run.id,
+        before_json=None,
+        after_json={
+            "dataset_id": str(dataset.id),
+            "workflow_version_id": str(version.id),
+            "status": eval_run.status.value,
+        },
+    )
+    return eval_run
+
+
+def mark_eval_run_running(session: Session, *, project_id: UUID, eval_run_id: UUID) -> EvalRun:
+    eval_run = get_eval_run(session, project_id=project_id, eval_run_id=eval_run_id)
+    if eval_run.status != EvalRunStatus.QUEUED:
+        raise ConflictError("only queued eval runs can start")
+    eval_run.status = EvalRunStatus.RUNNING
+    eval_run.started_at = utcnow()
+    session.flush()
+    return eval_run
+
+
+def finish_eval_run(
+    session: Session,
+    *,
+    project_id: UUID,
+    eval_run_id: UUID,
+    status: EvalRunStatus,
+    summary: dict,
+) -> EvalRun:
+    if status not in {EvalRunStatus.SUCCEEDED, EvalRunStatus.FAILED}:
+        raise ConflictError("eval run can only finish as succeeded or failed")
+    eval_run = get_eval_run(session, project_id=project_id, eval_run_id=eval_run_id)
+    eval_run.status = status
+    eval_run.summary_json = summary
+    eval_run.ended_at = utcnow()
+    session.flush()
+    return eval_run
+
+
+def list_eval_case_results(session: Session, *, project_id: UUID, eval_run_id: UUID) -> list[EvalCaseResult]:
+    get_eval_run(session, project_id=project_id, eval_run_id=eval_run_id)
+    return list(
+        session.scalars(
+            select(EvalCaseResult)
+            .where(EvalCaseResult.eval_run_id == eval_run_id)
+            .order_by(EvalCaseResult.created_at)
+        ).all()
+    )
+
+
+def create_eval_case_result(
+    session: Session,
+    *,
+    project_id: UUID,
+    eval_run_id: UUID,
+    eval_case_id: UUID,
+    run_id: UUID | None,
+    status: EvalCaseStatus,
+    scores: dict,
+    output: dict | None,
+    trace_grade: dict | None,
+    error: dict | None,
+) -> EvalCaseResult:
+    get_eval_run(session, project_id=project_id, eval_run_id=eval_run_id)
+    existing = session.scalar(
+        select(EvalCaseResult).where(
+            EvalCaseResult.eval_run_id == eval_run_id,
+            EvalCaseResult.eval_case_id == eval_case_id,
+        )
+    )
+    if existing is not None:
+        raise ConflictError("eval case result already exists")
+
+    result = EvalCaseResult(
+        eval_run_id=eval_run_id,
+        eval_case_id=eval_case_id,
+        run_id=run_id,
+        status=status,
+        scores_json=scores,
+        output_json=output,
+        trace_grade_json=trace_grade,
+        error_json=error,
+    )
+    session.add(result)
+    session.flush()
+    return result
 
 
 def create_workflow(

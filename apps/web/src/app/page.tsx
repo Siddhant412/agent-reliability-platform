@@ -96,6 +96,35 @@ type ToolDefinition = {
   description: string;
 };
 
+type Dataset = {
+  id: string;
+  name: string;
+  version: string;
+  description: string | null;
+};
+
+type EvalRun = {
+  id: string;
+  dataset_id: string;
+  workflow_version_id: string;
+  baseline_version_id: string | null;
+  status: string;
+  summary: Record<string, unknown>;
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+};
+
+type EvalCaseResult = {
+  id: string;
+  eval_run_id: string;
+  eval_case_id: string;
+  run_id: string | null;
+  status: string;
+  scores: Record<string, unknown>;
+  error: Record<string, unknown> | null;
+};
+
 type Timeline = {
   run: RunRecord;
   trace_spans: TraceSpan[];
@@ -150,11 +179,16 @@ export default function ConsolePage() {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [tools, setTools] = useState<ToolDefinition[]>([]);
+  const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
+  const [evalResults, setEvalResults] = useState<EvalCaseResult[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const selectedRunId = timeline?.run.id ?? runs[0]?.id ?? "";
+  const selectedWorkflowVersionId = timeline?.run.workflow_version_id ?? runs[0]?.workflow_version_id ?? "";
   const pendingApprovals = useMemo(() => approvals.filter((approval) => approval.status === "pending"), [approvals]);
+  const latestEvalRun = evalRuns[0] ?? null;
 
   const loadRuns = useCallback(async () => {
     if (!projectId) return;
@@ -209,9 +243,37 @@ export default function ConsolePage() {
     }
   }, [actorUserId, projectId]);
 
+  const loadEvals = useCallback(async () => {
+    if (!projectId) return;
+    setBusy("evals");
+    setError(null);
+    try {
+      const [datasetRecords, evalRunRecords] = await Promise.all([
+        api<Dataset[]>(`/api/v1/projects/${projectId}/datasets`, actorUserId),
+        api<EvalRun[]>(`/api/v1/projects/${projectId}/eval-runs`, actorUserId),
+      ]);
+      setDatasets(datasetRecords);
+      setEvalRuns(evalRunRecords);
+      if (evalRunRecords[0]) {
+        setEvalResults(
+          await api<EvalCaseResult[]>(
+            `/api/v1/projects/${projectId}/eval-runs/${evalRunRecords[0].id}/results`,
+            actorUserId,
+          ),
+        );
+      } else {
+        setEvalResults([]);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load evals");
+    } finally {
+      setBusy(null);
+    }
+  }, [actorUserId, projectId]);
+
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadRuns(), loadApprovals(), loadConnectors()]);
-  }, [loadApprovals, loadConnectors, loadRuns]);
+    await Promise.all([loadRuns(), loadApprovals(), loadConnectors(), loadEvals()]);
+  }, [loadApprovals, loadConnectors, loadEvals, loadRuns]);
 
   async function selectRun(runId: string) {
     setBusy(runId);
@@ -295,6 +357,35 @@ export default function ConsolePage() {
     }
   }
 
+  async function createAndRunEval() {
+    if (!projectId || !selectedWorkflowVersionId) return;
+    setBusy("eval");
+    setError(null);
+    try {
+      const datasetRecords =
+        datasets.length > 0 ? datasets : await api<Dataset[]>(`/api/v1/projects/${projectId}/datasets`, actorUserId);
+      const dataset = datasetRecords[0];
+      if (!dataset) {
+        throw new Error("No dataset found. Run the demo bootstrap first.");
+      }
+      const evalRun = await api<EvalRun>(`/api/v1/projects/${projectId}/eval-runs`, actorUserId, {
+        method: "POST",
+        body: JSON.stringify({
+          dataset_id: dataset.id,
+          workflow_version_id: selectedWorkflowVersionId,
+        }),
+      });
+      await api<EvalRun>(`/api/v1/projects/${projectId}/eval-runs/${evalRun.id}/execute`, actorUserId, {
+        method: "POST",
+      });
+      await Promise.all([loadEvals(), loadRuns()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to run eval");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <main className="shell">
       <header className="topbar">
@@ -324,7 +415,7 @@ export default function ConsolePage() {
           Workflow
           <input value={workflowSlug} onChange={(event) => setWorkflowSlug(event.target.value)} />
         </label>
-        <button onClick={loadRuns} disabled={!projectId || busy != null}>
+        <button onClick={refreshAll} disabled={!projectId || busy != null}>
           <Search size={16} /> Load
         </button>
         <button onClick={submitRun} disabled={!projectId || busy != null}>
@@ -332,6 +423,9 @@ export default function ConsolePage() {
         </button>
         <button onClick={seedSupportDemo} disabled={!projectId || busy != null}>
           <Database size={16} /> Seed
+        </button>
+        <button onClick={createAndRunEval} disabled={!projectId || !selectedWorkflowVersionId || busy != null}>
+          <ShieldCheck size={16} /> Eval
         </button>
       </section>
 
@@ -472,6 +566,49 @@ export default function ConsolePage() {
               </div>
             ))}
           </div>
+        </div>
+
+        <div className="panel evalPanel">
+          <div className="panelHeader">
+            <h2>Evals</h2>
+            <div className="headerActions">
+              <button
+                className="iconButton"
+                onClick={createAndRunEval}
+                disabled={!projectId || !selectedWorkflowVersionId || busy != null}
+                title="Run eval"
+              >
+                <Play size={17} />
+              </button>
+              <span>{evalRuns.length}</span>
+            </div>
+          </div>
+          {latestEvalRun ? (
+            <div className="evalList">
+              <div className="evalRow">
+                <div className="evalTitle">
+                  <span className={`pill ${statusClass(latestEvalRun.status)}`}>{latestEvalRun.status}</span>
+                  <strong>{datasets.find((dataset) => dataset.id === latestEvalRun.dataset_id)?.name ?? "Dataset"}</strong>
+                </div>
+                <div className="evalSummary">
+                  <Metric label="Cases" value={String(latestEvalRun.summary.total_cases ?? "-")} />
+                  <Metric label="Success" value={`${Math.round(Number(latestEvalRun.summary.success_rate ?? 0) * 100)}%`} />
+                  <Metric label="Schema" value={`${Math.round(Number(latestEvalRun.summary.schema_valid_rate ?? 0) * 100)}%`} />
+                </div>
+              </div>
+              {evalResults.map((result) => (
+                <div className="evalRow" key={result.id}>
+                  <div className="evalTitle">
+                    <span className={`pill ${statusClass(result.status)}`}>{result.status}</span>
+                    <code>{result.run_id ?? result.eval_case_id}</code>
+                  </div>
+                  <pre>{previewJson(result.error ?? result.scores)}</pre>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState icon={<ShieldCheck size={22} />} label="No eval runs" />
+          )}
         </div>
 
         <div className="panel callsPanel">
