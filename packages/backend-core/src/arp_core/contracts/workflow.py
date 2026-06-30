@@ -86,11 +86,16 @@ class WorkflowRead(BaseModel):
 
     id: UUID
     project_id: UUID
+    active_version_id: UUID | None = None
     slug: str
     name: str
     domain: str
     description: str | None = None
     created_at: datetime
+
+
+class SetActiveWorkflowVersionRequest(BaseModel):
+    workflow_version_id: UUID
 
 
 class WorkflowVersionCreate(BaseModel):

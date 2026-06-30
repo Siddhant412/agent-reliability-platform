@@ -126,13 +126,21 @@ class Workflow(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     __table_args__ = (UniqueConstraint("project_id", "slug", name="uq_workflows_project_slug"),)
 
     project_id: Mapped[UUID] = mapped_column(UUID_TYPE, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    active_version_id: Mapped[UUID | None] = mapped_column(
+        UUID_TYPE,
+        ForeignKey("workflow_versions.id", ondelete="SET NULL", use_alter=True),
+        nullable=True,
+    )
     slug: Mapped[str] = mapped_column(String(120), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     domain: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="workflows")
-    versions: Mapped[list["WorkflowVersion"]] = relationship(back_populates="workflow")
+    versions: Mapped[list["WorkflowVersion"]] = relationship(
+        back_populates="workflow",
+        foreign_keys="WorkflowVersion.workflow_id",
+    )
 
 
 class WorkflowVersion(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
@@ -158,7 +166,7 @@ class WorkflowVersion(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     created_by: Mapped[UUID | None] = mapped_column(UUID_TYPE, nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    workflow: Mapped["Workflow"] = relationship(back_populates="versions")
+    workflow: Mapped["Workflow"] = relationship(back_populates="versions", foreign_keys=[workflow_id])
     runs: Mapped[list["Run"]] = relationship(back_populates="workflow_version")
 
 

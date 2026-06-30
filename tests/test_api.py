@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from uuid import UUID
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
-
-from arp_worker.runner import execute_run
 
 
 def _workflow_version_payload(*, version: str = "1.0.0") -> dict:
@@ -359,6 +356,88 @@ def test_workflow_slug_run_submission_resolves_latest_published_version(client: 
     assert unknown_slug_response.json()["detail"] == "workflow not found"
 
 
+def test_workflow_slug_submission_uses_active_version_when_set(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="active-version-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="active-version-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    first_version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+        version="1.0.0",
+    )
+    second_version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+        version="1.1.0",
+    )
+
+    active_response = client.post(
+        f"/api/v1/workflows/{workflow_id}/active-version",
+        json={"workflow_version_id": first_version_id},
+        headers=owner,
+    )
+    assert active_response.status_code == 200
+    assert active_response.json()["active_version_id"] == first_version_id
+
+    run_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-250",
+                "customer_id": "C-250",
+                "message": "Use active version.",
+            },
+        },
+        headers=owner,
+    )
+    assert run_response.status_code == 201
+    assert run_response.json()["workflow_version_id"] == first_version_id
+    assert run_response.json()["workflow_version_id"] != second_version_id
+
+
+def test_support_demo_connector_seed_and_tool_registry(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="connector-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="connector-ops")
+
+    empty_connectors = client.get(f"/api/v1/projects/{project_id}/connectors", headers=owner)
+    assert empty_connectors.status_code == 200
+    assert empty_connectors.json() == []
+
+    seed_response = client.post(f"/api/v1/projects/{project_id}/connectors/support-demo/seed", headers=owner)
+    assert seed_response.status_code == 200
+    seeded_tools = seed_response.json()
+    assert {tool["name"] for tool in seeded_tools} == {
+        "kb_search",
+        "get_customer_profile",
+        "get_order",
+        "issue_refund",
+        "post_ticket_comment",
+        "send_customer_email",
+    }
+    assert next(tool for tool in seeded_tools if tool["name"] == "issue_refund")["is_mutating"] is True
+
+    connectors_response = client.get(f"/api/v1/projects/{project_id}/connectors", headers=owner)
+    assert connectors_response.status_code == 200
+    connectors = connectors_response.json()
+    assert len(connectors) == 1
+    connector = connectors[0]
+    assert connector["name"] == "Support Demo"
+    assert connector["status"] == "active"
+
+    tools_response = client.get(
+        f"/api/v1/projects/{project_id}/connectors/{connector['id']}/tools",
+        headers=owner,
+    )
+    assert tools_response.status_code == 200
+    assert [tool["name"] for tool in tools_response.json()] == sorted(tool["name"] for tool in seeded_tools)
+
+
 def test_run_status_transitions_and_trace_span_writes(client: TestClient) -> None:
     owner = _headers()
 
@@ -433,6 +512,22 @@ def test_run_status_transitions_and_trace_span_writes(client: TestClient) -> Non
     assert spans_response.status_code == 200
     assert [record["span_id"] for record in spans_response.json()] == ["1" * 16]
 
+    filtered_spans_response = client.get(
+        f"/api/v1/projects/{project_id}/runs/{run_id}/trace-spans",
+        params={"span_type": "run.start", "status": "in_progress"},
+        headers=owner,
+    )
+    assert filtered_spans_response.status_code == 200
+    assert [record["span_id"] for record in filtered_spans_response.json()] == ["1" * 16]
+
+    timeline_response = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}/timeline", headers=owner)
+    assert timeline_response.status_code == 200
+    timeline = timeline_response.json()
+    assert timeline["run"]["id"] == run_id
+    assert [record["span_id"] for record in timeline["trace_spans"]] == ["1" * 16]
+    assert timeline["tool_calls"] == []
+    assert timeline["approvals"] == []
+
     tool_calls_response = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}/tool-calls", headers=owner)
     assert tool_calls_response.status_code == 200
     assert tool_calls_response.json() == []
@@ -497,10 +592,9 @@ def test_approval_routes_allow_required_approver_to_decide(client: TestClient) -
     assert run_response.status_code == 201
     run_id = run_response.json()["id"]
 
-    with client.app.state.session_manager.session() as session:
-        result = execute_run(session, project_id=UUID(project_id), run_id=UUID(run_id))
-        session.commit()
-    assert result.status.value == "awaiting_approval"
+    execute_response = client.post(f"/api/v1/projects/{project_id}/runs/{run_id}/execute", headers=owner)
+    assert execute_response.status_code == 200
+    assert execute_response.json()["status"] == "awaiting_approval"
 
     approvals_response = client.get(
         f"/api/v1/projects/{project_id}/approvals",
@@ -527,6 +621,90 @@ def test_approval_routes_allow_required_approver_to_decide(client: TestClient) -
     run_after_decision = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}", headers=owner)
     assert run_after_decision.status_code == 200
     assert run_after_decision.json()["status"] == "resumed"
+
+    resumed_response = client.post(f"/api/v1/projects/{project_id}/runs/{run_id}/execute", headers=owner)
+    assert resumed_response.status_code == 200
+    resumed_body = resumed_response.json()
+    assert resumed_body["status"] == "succeeded"
+    assert resumed_body["final_output"]["disposition"] == "resolved"
+
+    tool_calls_response = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}/tool-calls", headers=owner)
+    assert tool_calls_response.status_code == 200
+    refund_call = next(record for record in tool_calls_response.json() if record["tool_name"] == "issue_refund")
+    assert refund_call["status"] == "executed"
+    assert refund_call["result"]["status"] == "issued"
+
+
+def test_execute_endpoint_completes_rejected_approval_as_escalated(client: TestClient) -> None:
+    owner = _headers()
+    supervisor = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="approval-reject-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="approval-reject-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+    )
+    membership_response = client.post(
+        f"/api/v1/projects/{project_id}/memberships",
+        json={"user_id": supervisor["X-Actor-User-Id"], "role": "supervisor"},
+        headers=owner,
+    )
+    assert membership_response.status_code == 201
+
+    run_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-501",
+                "customer_id": "C-500",
+                "message": "I was charged twice and need a refund.",
+            },
+        },
+        headers=owner,
+    )
+    assert run_response.status_code == 201
+    run_id = run_response.json()["id"]
+
+    execute_response = client.post(f"/api/v1/projects/{project_id}/runs/{run_id}/execute", headers=owner)
+    assert execute_response.status_code == 200
+    assert execute_response.json()["status"] == "awaiting_approval"
+
+    approvals_response = client.get(
+        f"/api/v1/projects/{project_id}/approvals",
+        params={"status": "pending"},
+        headers=owner,
+    )
+    assert approvals_response.status_code == 200
+    approval = approvals_response.json()[0]
+
+    rejected_response = client.post(
+        f"/api/v1/projects/{project_id}/approvals/{approval['id']}/decide",
+        json={"status": "rejected", "decision_note": "Refund not supported by payment evidence."},
+        headers=supervisor,
+    )
+    assert rejected_response.status_code == 200
+    assert rejected_response.json()["status"] == "rejected"
+
+    resumed_response = client.post(f"/api/v1/projects/{project_id}/runs/{run_id}/execute", headers=owner)
+    assert resumed_response.status_code == 200
+    resumed_body = resumed_response.json()
+    assert resumed_body["status"] == "succeeded"
+    assert resumed_body["final_output"]["disposition"] == "escalated"
+    assert resumed_body["final_output"]["proposed_actions"] == [
+        {
+            "tool": "manual_review",
+            "reason": "A requested action was rejected and needs a safer follow-up.",
+        }
+    ]
+
+    tool_calls_response = client.get(f"/api/v1/projects/{project_id}/runs/{run_id}/tool-calls", headers=owner)
+    assert tool_calls_response.status_code == 200
+    refund_call = next(record for record in tool_calls_response.json() if record["tool_name"] == "issue_refund")
+    assert refund_call["status"] == "rejected"
+    assert refund_call["result"] is None
 
 
 def test_draft_versions_can_be_updated_but_only_valid_definitions_can_publish(client: TestClient) -> None:

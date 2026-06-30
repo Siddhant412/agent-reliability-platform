@@ -19,6 +19,7 @@ from arp_core.application.auth import AuthenticatedActor
 from arp_core.contracts.serializers import workflow_to_read, workflow_version_to_read
 from arp_core.contracts.workflow import (
     PublishWorkflowVersionRequest,
+    SetActiveWorkflowVersionRequest,
     WorkflowCreate,
     WorkflowRead,
     WorkflowVersionCreate,
@@ -101,6 +102,26 @@ def create_workflow_version(
         actor_user_id=actor.user_id,
     )
     return workflow_version_to_read(version)
+
+
+@router.post("/api/v1/workflows/{workflow_id}/active-version", response_model=WorkflowRead)
+def set_active_workflow_version(
+    workflow_id: UUID,
+    payload: SetActiveWorkflowVersionRequest,
+    _: Annotated[
+        authz.WorkflowAccess,
+        Depends(require_workflow_access(permission=authz.ensure_project_can_write_workflows)),
+    ],
+    session: Annotated[Session, Depends(get_db_session)],
+    actor: Annotated[AuthenticatedActor, Depends(get_authenticated_actor)],
+) -> WorkflowRead:
+    workflow = services.set_active_workflow_version(
+        session,
+        workflow_id=workflow_id,
+        payload=payload,
+        actor_user_id=actor.user_id,
+    )
+    return workflow_to_read(workflow)
 
 
 @router.patch("/api/v1/workflow-versions/{workflow_version_id}", response_model=WorkflowVersionRead)

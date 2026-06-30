@@ -5,6 +5,7 @@ from uuid import UUID
 from arp_core.contracts.approval import ApprovalRequestRead
 from arp_core.contracts.run import RunRead, ToolCallRead, TraceSpanRead
 from arp_core.contracts.tenant import MembershipRead, OrganizationRead, ProjectRead
+from arp_core.contracts.tooling import ConnectorRead, ToolDefinitionRead
 from arp_core.contracts.workflow import (
     ModelConfig,
     WorkflowPolicyRule,
@@ -15,10 +16,12 @@ from arp_core.contracts.workflow import (
 )
 from arp_core.persistence.models import (
     ApprovalRequest,
+    Connector,
     Membership,
     Organization,
     Project,
     Run,
+    ToolDefinition,
     ToolCall,
     TraceSpan,
     Workflow,
@@ -139,4 +142,33 @@ def approval_request_to_read(record: ApprovalRequest) -> ApprovalRequestRead:
         decided_at=record.decided_at,
         decided_by=record.decided_by,
         decision_note=record.decision_note,
+    )
+
+
+def connector_to_read(record: Connector) -> ConnectorRead:
+    return ConnectorRead(
+        id=record.id,
+        org_id=record.org_id,
+        project_id=record.project_id,
+        name=record.name,
+        connector_type=record.connector_type,
+        auth_mode=record.auth_mode,
+        scopes=record.scopes_json,
+        status=record.status,
+        owner_user_id=record.owner_user_id,
+        created_at=record.created_at,
+    )
+
+
+def tool_definition_to_read(record: ToolDefinition) -> ToolDefinitionRead:
+    return ToolDefinitionRead(
+        id=record.id,
+        connector_id=record.connector_id,
+        name=record.name,
+        description=record.description,
+        risk_level=record.risk_level,
+        input_schema=record.input_schema_json,
+        output_schema=record.output_schema_json,
+        is_mutating=record.is_mutating,
+        created_at=record.created_at,
     )

@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from arp_core.contracts.approval import ApprovalRequestRead
 from arp_core.domain.enums import RunStatus, SpanStatus, ToolCallStatus
 
 
@@ -112,3 +113,10 @@ class ToolCallRead(BaseModel):
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     created_at: datetime
+
+
+class RunTimelineRead(BaseModel):
+    run: RunRead
+    trace_spans: list[TraceSpanRead]
+    tool_calls: list[ToolCallRead]
+    approvals: list[ApprovalRequestRead]

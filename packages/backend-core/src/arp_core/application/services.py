@@ -20,20 +20,24 @@ from arp_core.contracts.run import (
     WorkflowRunSubmitRequest,
 )
 from arp_core.contracts.tenant import MembershipCreate, OrganizationCreate, ProjectCreate
+from arp_core.contracts.tooling import ConnectorCreate, ToolDefinitionCreate
 from arp_core.contracts.workflow import (
     PublishWorkflowVersionRequest,
+    SetActiveWorkflowVersionRequest,
     WorkflowCreate,
     WorkflowVersionCreate,
     WorkflowVersionUpdate,
 )
-from arp_core.domain.enums import ApprovalStatus, MembershipRole, RunStatus, ToolCallStatus, WorkflowVersionStatus
+from arp_core.domain.enums import ApprovalStatus, MembershipRole, RunStatus, SpanStatus, ToolCallStatus, WorkflowVersionStatus
 from arp_core.persistence.base import utcnow
 from arp_core.persistence.models import (
     ApprovalRequest,
+    Connector,
     Membership,
     Organization,
     Project,
     Run,
+    ToolDefinition,
     ToolCall,
     TraceSpan,
     Workflow,
@@ -440,6 +444,124 @@ def create_project_membership(
     return membership
 
 
+def list_connectors(session: Session, *, project_id: UUID) -> list[Connector]:
+    return list(
+        session.scalars(
+            select(Connector)
+            .where(Connector.project_id == project_id)
+            .order_by(Connector.created_at.desc())
+        ).all()
+    )
+
+
+def create_connector(
+    session: Session,
+    *,
+    project_id: UUID,
+    payload: ConnectorCreate,
+    actor_user_id: UUID | None,
+) -> Connector:
+    project = _first_or_404(session, select(Project).where(Project.id == project_id), "project not found")
+    connector = Connector(
+        org_id=None,
+        project_id=project_id,
+        name=payload.name,
+        connector_type=payload.connector_type,
+        auth_mode=payload.auth_mode,
+        scopes_json=list(payload.scopes),
+        status=payload.status,
+        owner_user_id=actor_user_id,
+    )
+    session.add(connector)
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=project.org_id,
+        project_id=project_id,
+        action="connector.create",
+        resource_type="connector",
+        resource_id=connector.id,
+        before_json=None,
+        after_json={
+            "name": connector.name,
+            "connector_type": connector.connector_type.value,
+            "auth_mode": connector.auth_mode.value,
+            "status": connector.status.value,
+        },
+    )
+    return connector
+
+
+def get_connector(session: Session, *, project_id: UUID, connector_id: UUID) -> Connector:
+    return _first_or_404(
+        session,
+        select(Connector).where(Connector.project_id == project_id, Connector.id == connector_id),
+        "connector not found",
+    )
+
+
+def list_tool_definitions(session: Session, *, project_id: UUID, connector_id: UUID) -> list[ToolDefinition]:
+    get_connector(session, project_id=project_id, connector_id=connector_id)
+    return list(
+        session.scalars(
+            select(ToolDefinition)
+            .where(ToolDefinition.connector_id == connector_id)
+            .order_by(ToolDefinition.name)
+        ).all()
+    )
+
+
+def create_tool_definition(
+    session: Session,
+    *,
+    project_id: UUID,
+    connector_id: UUID,
+    payload: ToolDefinitionCreate,
+    actor_user_id: UUID | None,
+) -> ToolDefinition:
+    connector = get_connector(session, project_id=project_id, connector_id=connector_id)
+    existing = session.scalar(
+        select(ToolDefinition).where(
+            ToolDefinition.connector_id == connector_id,
+            ToolDefinition.name == payload.name,
+        )
+    )
+    if existing is not None:
+        raise ConflictError("tool definition already exists for this connector")
+
+    tool = ToolDefinition(
+        connector_id=connector_id,
+        name=payload.name,
+        description=payload.description,
+        risk_level=payload.risk_level,
+        input_schema_json=payload.input_schema,
+        output_schema_json=payload.output_schema,
+        is_mutating=payload.is_mutating,
+    )
+    session.add(tool)
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=connector.org_id,
+        project_id=project_id,
+        action="tool_definition.create",
+        resource_type="tool_definition",
+        resource_id=tool.id,
+        before_json=None,
+        after_json={
+            "connector_id": str(connector_id),
+            "name": tool.name,
+            "risk_level": tool.risk_level.value,
+            "is_mutating": tool.is_mutating,
+        },
+    )
+    return tool
+
+
 def create_workflow(
     session: Session,
     *,
@@ -457,6 +579,7 @@ def create_workflow(
 
     workflow = Workflow(
         project_id=project_id,
+        active_version_id=None,
         slug=payload.slug,
         name=payload.name,
         domain=payload.domain,
@@ -670,6 +793,46 @@ def publish_workflow_version(
     return version
 
 
+def set_active_workflow_version(
+    session: Session,
+    *,
+    workflow_id: UUID,
+    payload: SetActiveWorkflowVersionRequest,
+    actor_user_id: UUID | None,
+) -> Workflow:
+    workflow = _first_or_404(
+        session,
+        select(Workflow).options(joinedload(Workflow.project)).where(Workflow.id == workflow_id),
+        "workflow not found",
+    )
+    version = _first_or_404(
+        session,
+        select(WorkflowVersion).where(WorkflowVersion.id == payload.workflow_version_id),
+        "workflow version not found",
+    )
+    if version.workflow_id != workflow.id:
+        raise ConflictError("workflow version does not belong to this workflow")
+    if version.status != WorkflowVersionStatus.PUBLISHED:
+        raise ConflictError("only published workflow versions can be activated")
+
+    before_json = {"active_version_id": str(workflow.active_version_id) if workflow.active_version_id else None}
+    workflow.active_version_id = version.id
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=workflow.project.org_id,
+        project_id=workflow.project_id,
+        action="workflow.active_version.set",
+        resource_type="workflow",
+        resource_id=workflow.id,
+        before_json=before_json,
+        after_json={"active_version_id": str(version.id), "version": version.version},
+    )
+    return workflow
+
+
 def list_runs(session: Session, *, project_id: UUID) -> list[Run]:
     return list(
         session.scalars(select(Run).where(Run.project_id == project_id).order_by(Run.created_at.desc())).all()
@@ -719,15 +882,26 @@ def submit_workflow_run(
         select(Workflow).where(Workflow.project_id == project_id, Workflow.slug == workflow_slug),
         "workflow not found",
     )
-    version = session.scalar(
-        select(WorkflowVersion)
-        .options(joinedload(WorkflowVersion.workflow).joinedload(Workflow.project))
-        .where(
-            WorkflowVersion.workflow_id == workflow.id,
-            WorkflowVersion.status == WorkflowVersionStatus.PUBLISHED,
+    if workflow.active_version_id is not None:
+        version = session.scalar(
+            select(WorkflowVersion)
+            .options(joinedload(WorkflowVersion.workflow).joinedload(Workflow.project))
+            .where(
+                WorkflowVersion.id == workflow.active_version_id,
+                WorkflowVersion.workflow_id == workflow.id,
+                WorkflowVersion.status == WorkflowVersionStatus.PUBLISHED,
+            )
         )
-        .order_by(WorkflowVersion.published_at.desc(), WorkflowVersion.created_at.desc())
-    )
+    else:
+        version = session.scalar(
+            select(WorkflowVersion)
+            .options(joinedload(WorkflowVersion.workflow).joinedload(Workflow.project))
+            .where(
+                WorkflowVersion.workflow_id == workflow.id,
+                WorkflowVersion.status == WorkflowVersionStatus.PUBLISHED,
+            )
+            .order_by(WorkflowVersion.published_at.desc(), WorkflowVersion.created_at.desc())
+        )
     if version is None:
         raise NotFoundError("published workflow version not found")
 
@@ -785,13 +959,23 @@ def transition_run_status(
     return run
 
 
-def list_trace_spans(session: Session, *, project_id: UUID, run_id: UUID) -> list[TraceSpan]:
+def list_trace_spans(
+    session: Session,
+    *,
+    project_id: UUID,
+    run_id: UUID,
+    span_type: str | None = None,
+    status: SpanStatus | None = None,
+) -> list[TraceSpan]:
     get_run(session, project_id=project_id, run_id=run_id)
+    statement = select(TraceSpan).where(TraceSpan.project_id == project_id, TraceSpan.run_id == run_id)
+    if span_type is not None:
+        statement = statement.where(TraceSpan.span_type == span_type)
+    if status is not None:
+        statement = statement.where(TraceSpan.status == status)
     return list(
         session.scalars(
-            select(TraceSpan)
-            .where(TraceSpan.project_id == project_id, TraceSpan.run_id == run_id)
-            .order_by(TraceSpan.started_at, TraceSpan.created_at)
+            statement.order_by(TraceSpan.started_at, TraceSpan.created_at)
         ).all()
     )
 
@@ -910,9 +1094,12 @@ def list_approval_requests(
     session: Session,
     *,
     project_id: UUID,
+    run_id: UUID | None = None,
     status: ApprovalStatus | None = None,
 ) -> list[ApprovalRequest]:
     statement = select(ApprovalRequest).where(ApprovalRequest.project_id == project_id)
+    if run_id is not None:
+        statement = statement.where(ApprovalRequest.run_id == run_id)
     if status is not None:
         statement = statement.where(ApprovalRequest.status == status)
     return list(session.scalars(statement.order_by(ApprovalRequest.requested_at.desc())).all())

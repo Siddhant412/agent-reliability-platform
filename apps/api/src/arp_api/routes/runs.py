@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from arp_api.dependencies.auth import get_authenticated_actor, require_project_access
@@ -14,13 +14,16 @@ from arp_core.application.auth import AuthenticatedActor
 from arp_core.contracts.run import (
     RunRead,
     RunSubmitRequest,
+    RunTimelineRead,
     RunTransitionRequest,
     ToolCallRead,
     TraceSpanCreate,
     TraceSpanRead,
     WorkflowRunSubmitRequest,
 )
-from arp_core.contracts.serializers import run_to_read, tool_call_to_read, trace_span_to_read
+from arp_core.contracts.serializers import approval_request_to_read, run_to_read, tool_call_to_read, trace_span_to_read
+from arp_core.domain.enums import SpanStatus
+from arp_worker.runner import execute_run as execute_worker_run
 
 
 router = APIRouter(tags=["runs"])
@@ -82,17 +85,62 @@ def transition_run_status(
     return run_to_read(run)
 
 
+@router.post("/api/v1/projects/{project_id}/runs/{run_id}/execute", response_model=RunRead)
+def execute_run(
+    project_id: UUID,
+    run_id: UUID,
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    session: Annotated[Session, Depends(get_db_session)],
+) -> RunRead:
+    execute_worker_run(session, project_id=project_id, run_id=run_id)
+    run = services.get_run(session, project_id=project_id, run_id=run_id)
+    return run_to_read(run)
+
+
 @router.get("/api/v1/projects/{project_id}/runs/{run_id}/trace-spans", response_model=list[TraceSpanRead])
 def list_trace_spans(
     project_id: UUID,
     run_id: UUID,
     _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
     session: Annotated[Session, Depends(get_db_session)],
+    span_type: str | None = Query(default=None),
+    status: SpanStatus | None = Query(default=None),
 ) -> list[TraceSpanRead]:
     return [
         trace_span_to_read(record)
-        for record in services.list_trace_spans(session, project_id=project_id, run_id=run_id)
+        for record in services.list_trace_spans(
+            session,
+            project_id=project_id,
+            run_id=run_id,
+            span_type=span_type,
+            status=status,
+        )
     ]
+
+
+@router.get("/api/v1/projects/{project_id}/runs/{run_id}/timeline", response_model=RunTimelineRead)
+def get_run_timeline(
+    project_id: UUID,
+    run_id: UUID,
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    session: Annotated[Session, Depends(get_db_session)],
+) -> RunTimelineRead:
+    run = services.get_run(session, project_id=project_id, run_id=run_id)
+    return RunTimelineRead(
+        run=run_to_read(run),
+        trace_spans=[
+            trace_span_to_read(record)
+            for record in services.list_trace_spans(session, project_id=project_id, run_id=run_id)
+        ],
+        tool_calls=[
+            tool_call_to_read(record)
+            for record in services.list_tool_calls(session, project_id=project_id, run_id=run_id)
+        ],
+        approvals=[
+            approval_request_to_read(record)
+            for record in services.list_approval_requests(session, project_id=project_id, run_id=run_id)
+        ],
+    )
 
 
 @router.post(

@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from arp_api.routes.approvals import router as approvals_router
 from arp_api.routes.auth import router as auth_router
+from arp_api.routes.connectors import router as connectors_router
 from arp_api.routes.health import router as health_router
 from arp_api.routes.memberships import router as memberships_router
 from arp_api.routes.organizations import router as organizations_router
@@ -52,6 +53,7 @@ def create_app(*, database_url: str | None = None) -> FastAPI:
     app.include_router(memberships_router)
     app.include_router(organizations_router)
     app.include_router(projects_router)
+    app.include_router(connectors_router)
     app.include_router(workflows_router)
     app.include_router(runs_router)
     app.include_router(approvals_router)

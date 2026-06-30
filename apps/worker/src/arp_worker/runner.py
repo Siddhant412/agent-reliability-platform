@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError as JSONSchemaValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
@@ -421,6 +423,20 @@ def _finish_run(
     trace_id: str,
     final_output: dict[str, Any],
 ) -> WorkerExecutionResult:
+    try:
+        Draft202012Validator.check_schema(run.workflow_version.output_schema_json)
+        Draft202012Validator(run.workflow_version.output_schema_json).validate(final_output)
+    except SchemaError as exc:
+        raise DeterministicWorkerError(f"workflow output_schema is invalid: {exc.message}") from exc
+    except JSONSchemaValidationError as exc:
+        location = "final_output"
+        for path_part in exc.absolute_path:
+            if isinstance(path_part, int):
+                location += f"[{path_part}]"
+            else:
+                location += f".{path_part}"
+        raise DeterministicWorkerError(f"{location}: {exc.message}") from exc
+
     _emit_span(
         session,
         project_id=run.project_id,

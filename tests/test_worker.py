@@ -67,7 +67,12 @@ def _approval_workflow_version_payload() -> WorkflowVersionCreate:
     return WorkflowVersionCreate.model_validate(payload)
 
 
-def _create_queued_run(session: Session, *, message: str = "I was charged twice."):
+def _create_queued_run(
+    session: Session,
+    *,
+    message: str = "I was charged twice.",
+    version_payload: WorkflowVersionCreate | None = None,
+):
     actor_user_id = uuid4()
     organization = services.create_organization(
         session,
@@ -94,7 +99,7 @@ def _create_queued_run(session: Session, *, message: str = "I was charged twice.
     version = services.create_workflow_version(
         session,
         workflow_id=workflow.id,
-        payload=_workflow_version_payload(),
+        payload=version_payload or _workflow_version_payload(),
         actor_user_id=actor_user_id,
     )
     version = services.publish_workflow_version(
@@ -260,6 +265,38 @@ def test_deterministic_worker_marks_failed_tool_call_and_run_failure(db_session:
     assert tool_calls[0].error_json == {
         "type": "SupportToolError",
         "message": "forced support demo tool failure",
+    }
+
+
+def test_deterministic_worker_fails_when_final_output_violates_schema(db_session: Session) -> None:
+    payload = _workflow_version_payload().model_dump(mode="json", by_alias=True)
+    payload["output_schema"] = {
+        "type": "object",
+        "required": ["summary", "resolution_code"],
+        "properties": {
+            "summary": {"type": "string"},
+            "resolution_code": {"type": "string"},
+        },
+    }
+    project, _, run = _create_queued_run(
+        db_session,
+        version_payload=WorkflowVersionCreate.model_validate(payload),
+    )
+
+    result = execute_run(db_session, project_id=project.id, run_id=run.id)
+
+    assert result.status == RunStatus.FAILED
+    db_session.refresh(run)
+    assert run.status == RunStatus.FAILED
+    assert run.final_output_json is None
+
+    spans = services.list_trace_spans(db_session, project_id=project.id, run_id=run.id)
+    finish_span = spans[-1]
+    assert finish_span.span_type == "run.finish"
+    assert finish_span.status == SpanStatus.ERROR
+    assert finish_span.error_json == {
+        "type": "DeterministicWorkerError",
+        "message": "final_output: 'resolution_code' is a required property",
     }
 
 
