@@ -18,6 +18,7 @@ from arp_core.application import services
 from arp_core.application.auth import AuthenticatedActor
 from arp_core.contracts.serializers import workflow_to_read, workflow_version_to_read
 from arp_core.contracts.workflow import (
+    ActivateWorkflowRolloutRequest,
     PublishWorkflowVersionRequest,
     SetActiveWorkflowVersionRequest,
     WorkflowCreate,
@@ -116,6 +117,26 @@ def set_active_workflow_version(
     actor: Annotated[AuthenticatedActor, Depends(get_authenticated_actor)],
 ) -> WorkflowRead:
     workflow = services.set_active_workflow_version(
+        session,
+        workflow_id=workflow_id,
+        payload=payload,
+        actor_user_id=actor.user_id,
+    )
+    return workflow_to_read(workflow)
+
+
+@router.post("/api/v1/workflows/{workflow_id}/rollout/activate", response_model=WorkflowRead)
+def activate_workflow_rollout(
+    workflow_id: UUID,
+    payload: ActivateWorkflowRolloutRequest,
+    _: Annotated[
+        authz.WorkflowAccess,
+        Depends(require_workflow_access(permission=authz.ensure_project_can_write_workflows)),
+    ],
+    session: Annotated[Session, Depends(get_db_session)],
+    actor: Annotated[AuthenticatedActor, Depends(get_authenticated_actor)],
+) -> WorkflowRead:
+    workflow = services.activate_workflow_rollout(
         session,
         workflow_id=workflow_id,
         payload=payload,

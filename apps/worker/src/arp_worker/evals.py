@@ -20,6 +20,28 @@ class EvalExecutionResult:
     summary: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class EvalAttemptResult:
+    run_id: UUID | None
+    succeeded: bool
+    schema_valid: bool
+    failed_tool_calls: int
+    unresolved_approvals: int
+    final_status: str | None
+    output: dict[str, Any] | None
+    trace_grade: dict[str, Any] | None
+    error: dict[str, Any] | None
+
+    def scores(self) -> dict[str, Any]:
+        return {
+            "run_succeeded": self.final_status == RunStatus.SUCCEEDED.value,
+            "output_schema_valid": self.schema_valid,
+            "failed_tool_calls": self.failed_tool_calls,
+            "unresolved_approvals": self.unresolved_approvals,
+            "final_status": self.final_status,
+        }
+
+
 def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -> EvalExecutionResult:
     eval_run = services.mark_eval_run_running(session, project_id=project_id, eval_run_id=eval_run_id)
     cases = services.list_eval_cases(session, project_id=project_id, dataset_id=eval_run.dataset_id)
@@ -31,6 +53,12 @@ def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -
         "schema_valid": 0,
         "failed_tool_calls": 0,
         "unresolved_approvals": 0,
+        "baseline_succeeded": 0,
+        "baseline_failed": 0,
+        "baseline_schema_valid": 0,
+        "candidate_better": 0,
+        "candidate_worse": 0,
+        "unchanged": 0,
     }
 
     try:
@@ -40,6 +68,7 @@ def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -
                 project_id=project_id,
                 eval_run_id=eval_run_id,
                 workflow_version_id=eval_run.workflow_version_id,
+                baseline_version_id=eval_run.baseline_version_id,
                 eval_case_id=eval_case.id,
                 input_payload=eval_case.input_json,
             )
@@ -51,12 +80,27 @@ def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -
                 totals["failed"] += 1
             if case_summary["schema_valid"]:
                 totals["schema_valid"] += 1
+            if case_summary["baseline_present"]:
+                if case_summary["baseline_succeeded"]:
+                    totals["baseline_succeeded"] += 1
+                else:
+                    totals["baseline_failed"] += 1
+                if case_summary["baseline_schema_valid"]:
+                    totals["baseline_schema_valid"] += 1
+                comparison = case_summary["comparison"]
+                if comparison in {"candidate_better", "candidate_worse", "unchanged"}:
+                    totals[comparison] += 1
 
         total_cases = totals["total_cases"]
+        baseline_cases = totals["baseline_succeeded"] + totals["baseline_failed"]
         summary = {
             **totals,
             "success_rate": (totals["succeeded"] / total_cases) if total_cases else 0,
             "schema_valid_rate": (totals["schema_valid"] / total_cases) if total_cases else 0,
+            "baseline_success_rate": (totals["baseline_succeeded"] / baseline_cases) if baseline_cases else None,
+            "baseline_schema_valid_rate": (
+                (totals["baseline_schema_valid"] / baseline_cases) if baseline_cases else None
+            ),
         }
         eval_run = services.finish_eval_run(
             session,
@@ -70,6 +114,8 @@ def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -
             **totals,
             "success_rate": (totals["succeeded"] / totals["total_cases"]) if totals["total_cases"] else 0,
             "schema_valid_rate": (totals["schema_valid"] / totals["total_cases"]) if totals["total_cases"] else 0,
+            "baseline_success_rate": None,
+            "baseline_schema_valid_rate": None,
             "runner_error": True,
         }
         eval_run = services.finish_eval_run(
@@ -90,9 +136,68 @@ def _execute_eval_case(
     project_id: UUID,
     eval_run_id: UUID,
     workflow_version_id: UUID,
+    baseline_version_id: UUID | None,
     eval_case_id: UUID,
     input_payload: dict[str, Any],
 ) -> dict[str, Any]:
+    candidate = _execute_eval_attempt(
+        session,
+        project_id=project_id,
+        workflow_version_id=workflow_version_id,
+        input_payload=input_payload,
+    )
+    baseline = (
+        _execute_eval_attempt(
+            session,
+            project_id=project_id,
+            workflow_version_id=baseline_version_id,
+            input_payload=input_payload,
+        )
+        if baseline_version_id is not None
+        else None
+    )
+    comparison = _compare_attempts(candidate=candidate, baseline=baseline)
+    scores = {
+        **candidate.scores(),
+        "candidate": candidate.scores(),
+        "baseline": baseline.scores() if baseline is not None else None,
+        "comparison": comparison,
+    }
+    trace_grade = candidate.trace_grade or {}
+    if baseline is not None and baseline.trace_grade is not None:
+        trace_grade = {**trace_grade, "baseline": baseline.trace_grade}
+
+    services.create_eval_case_result(
+        session,
+        project_id=project_id,
+        eval_run_id=eval_run_id,
+        eval_case_id=eval_case_id,
+        run_id=candidate.run_id,
+        status=EvalCaseStatus.SUCCEEDED if candidate.succeeded else EvalCaseStatus.FAILED,
+        scores=scores,
+        output=candidate.output,
+        trace_grade=trace_grade or None,
+        error=candidate.error if candidate.error is not None else None,
+    )
+    return {
+        "succeeded": candidate.succeeded,
+        "schema_valid": candidate.schema_valid,
+        "failed_tool_calls": candidate.failed_tool_calls,
+        "unresolved_approvals": candidate.unresolved_approvals,
+        "baseline_present": baseline is not None,
+        "baseline_succeeded": baseline.succeeded if baseline is not None else False,
+        "baseline_schema_valid": baseline.schema_valid if baseline is not None else False,
+        "comparison": comparison,
+    }
+
+
+def _execute_eval_attempt(
+    session: Session,
+    *,
+    project_id: UUID,
+    workflow_version_id: UUID,
+    input_payload: dict[str, Any],
+) -> EvalAttemptResult:
     run_id: UUID | None = None
     try:
         run = services.submit_run(
@@ -104,7 +209,6 @@ def _execute_eval_case(
         run_id = run.id
         execution = execute_run(session, project_id=project_id, run_id=run.id)
         run = services.get_run(session, project_id=project_id, run_id=run.id)
-
         failed_tool_calls = len(
             [
                 tool_call
@@ -122,55 +226,44 @@ def _execute_eval_case(
         )
         schema_valid = run.status == RunStatus.SUCCEEDED and run.final_output_json is not None
         succeeded = schema_valid and failed_tool_calls == 0 and unresolved_approvals == 0
-        scores = {
-            "run_succeeded": run.status == RunStatus.SUCCEEDED,
-            "output_schema_valid": schema_valid,
-            "failed_tool_calls": failed_tool_calls,
-            "unresolved_approvals": unresolved_approvals,
-            "final_status": run.status.value,
-        }
-        services.create_eval_case_result(
-            session,
-            project_id=project_id,
-            eval_run_id=eval_run_id,
-            eval_case_id=eval_case_id,
+        return EvalAttemptResult(
             run_id=run.id,
-            status=EvalCaseStatus.SUCCEEDED if succeeded else EvalCaseStatus.FAILED,
-            scores=scores,
+            succeeded=succeeded,
+            schema_valid=schema_valid,
+            failed_tool_calls=failed_tool_calls,
+            unresolved_approvals=unresolved_approvals,
+            final_status=run.status.value,
             output=run.final_output_json,
             trace_grade={
+                "run_id": str(run.id),
                 "trace_id": execution.trace_id,
                 "span_count": len(services.list_trace_spans(session, project_id=project_id, run_id=run.id)),
             },
             error=None if succeeded else {"message": "case did not satisfy eval success criteria"},
         )
-        return {
-            "succeeded": succeeded,
-            "schema_valid": schema_valid,
-            "failed_tool_calls": failed_tool_calls,
-            "unresolved_approvals": unresolved_approvals,
-        }
     except ApplicationError as exc:
-        services.create_eval_case_result(
-            session,
-            project_id=project_id,
-            eval_run_id=eval_run_id,
-            eval_case_id=eval_case_id,
+        return EvalAttemptResult(
             run_id=run_id,
-            status=EvalCaseStatus.FAILED,
-            scores={
-                "run_succeeded": False,
-                "output_schema_valid": False,
-                "failed_tool_calls": 0,
-                "unresolved_approvals": 0,
-            },
+            succeeded=False,
+            schema_valid=False,
+            failed_tool_calls=0,
+            unresolved_approvals=0,
+            final_status=None,
             output=None,
             trace_grade=None,
             error={"type": exc.__class__.__name__, "message": str(exc)},
         )
-        return {
-            "succeeded": False,
-            "schema_valid": False,
-            "failed_tool_calls": 0,
-            "unresolved_approvals": 0,
-        }
+
+
+def _compare_attempts(*, candidate: EvalAttemptResult, baseline: EvalAttemptResult | None) -> str | None:
+    if baseline is None:
+        return None
+    if candidate.succeeded and not baseline.succeeded:
+        return "candidate_better"
+    if baseline.succeeded and not candidate.succeeded:
+        return "candidate_worse"
+    if candidate.schema_valid and not baseline.schema_valid:
+        return "candidate_better"
+    if baseline.schema_valid and not candidate.schema_valid:
+        return "candidate_worse"
+    return "unchanged"

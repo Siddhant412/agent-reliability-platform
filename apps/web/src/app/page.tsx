@@ -592,8 +592,20 @@ export default function ConsolePage() {
                 </div>
                 <div className="evalSummary">
                   <Metric label="Cases" value={String(latestEvalRun.summary.total_cases ?? "-")} />
-                  <Metric label="Success" value={`${Math.round(Number(latestEvalRun.summary.success_rate ?? 0) * 100)}%`} />
-                  <Metric label="Schema" value={`${Math.round(Number(latestEvalRun.summary.schema_valid_rate ?? 0) * 100)}%`} />
+                  <Metric
+                    label="Candidate"
+                    value={`${Math.round(Number(latestEvalRun.summary.success_rate ?? 0) * 100)}%`}
+                  />
+                  <Metric
+                    label="Baseline"
+                    value={
+                      latestEvalRun.summary.baseline_success_rate == null
+                        ? "-"
+                        : `${Math.round(Number(latestEvalRun.summary.baseline_success_rate) * 100)}%`
+                    }
+                  />
+                  <Metric label="Better" value={String(latestEvalRun.summary.candidate_better ?? "-")} />
+                  <Metric label="Worse" value={String(latestEvalRun.summary.candidate_worse ?? "-")} />
                 </div>
               </div>
               {evalResults.map((result) => (

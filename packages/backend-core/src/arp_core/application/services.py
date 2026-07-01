@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from uuid import UUID
 
@@ -23,6 +25,7 @@ from arp_core.contracts.run import (
 from arp_core.contracts.tenant import MembershipCreate, OrganizationCreate, ProjectCreate
 from arp_core.contracts.tooling import ConnectorCreate, ToolDefinitionCreate
 from arp_core.contracts.workflow import (
+    ActivateWorkflowRolloutRequest,
     PublishWorkflowVersionRequest,
     SetActiveWorkflowVersionRequest,
     WorkflowCreate,
@@ -34,6 +37,7 @@ from arp_core.domain.enums import (
     EvalCaseStatus,
     EvalRunStatus,
     MembershipRole,
+    RolloutStrategy,
     RunStatus,
     SpanStatus,
     ToolCallStatus,
@@ -166,6 +170,7 @@ def _create_run_for_version(
     input_payload: dict,
     triggered_by: UUID | None,
     actor_user_id: UUID | None,
+    routing_context: dict[str, object] | None = None,
 ) -> Run:
     _validate_run_input_payload(input_schema=version.input_schema_json, input_payload=input_payload)
 
@@ -193,9 +198,81 @@ def _create_run_for_version(
         after_json={
             "workflow_version_id": str(version.id),
             "status": run.status.value,
+            **({"routing": routing_context} if routing_context is not None else {}),
         },
     )
     return run
+
+
+def _rollout_identity_key(*, input_payload: dict) -> str:
+    for key in ("request_id", "ticket_id", "customer_id"):
+        value = input_payload.get(key)
+        if value is not None:
+            return str(value)
+    return json.dumps(input_payload, sort_keys=True, separators=(",", ":"))
+
+
+def _rollout_bucket(*, project_id: UUID, workflow_slug: str, input_payload: dict) -> int:
+    identity_key = _rollout_identity_key(input_payload=input_payload)
+    digest = hashlib.sha256(f"{project_id}:{workflow_slug}:{identity_key}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100
+
+
+def _get_published_workflow_version_by_version(
+    session: Session,
+    *,
+    workflow_id: UUID,
+    version: str,
+) -> WorkflowVersion | None:
+    return session.scalar(
+        select(WorkflowVersion)
+        .options(joinedload(WorkflowVersion.workflow).joinedload(Workflow.project))
+        .where(
+            WorkflowVersion.workflow_id == workflow_id,
+            WorkflowVersion.version == version,
+            WorkflowVersion.status == WorkflowVersionStatus.PUBLISHED,
+        )
+    )
+
+
+def _resolve_active_rollout_version(
+    session: Session,
+    *,
+    workflow: Workflow,
+    active_version: WorkflowVersion,
+    input_payload: dict,
+) -> tuple[WorkflowVersion, dict[str, object] | None]:
+    config = active_version.rollout_config_json
+    if not config or config.get("strategy") != RolloutStrategy.CANARY.value:
+        return active_version, None
+    if config.get("candidate_version") != active_version.version:
+        return active_version, None
+
+    traffic_split = config.get("traffic_split") or {}
+    candidate_percentage = int(traffic_split.get("candidate") or 0)
+    baseline_version = config.get("baseline_version")
+    if not baseline_version:
+        raise ConflictError("active rollout is missing baseline_version")
+
+    baseline = _get_published_workflow_version_by_version(
+        session,
+        workflow_id=workflow.id,
+        version=str(baseline_version),
+    )
+    if baseline is None:
+        raise ConflictError("active rollout baseline version is not published")
+
+    bucket = _rollout_bucket(project_id=workflow.project_id, workflow_slug=workflow.slug, input_payload=input_payload)
+    selected_arm = "candidate" if bucket < candidate_percentage else "baseline"
+    selected = active_version if selected_arm == "candidate" else baseline
+    return selected, {
+        "strategy": RolloutStrategy.CANARY.value,
+        "selected_arm": selected_arm,
+        "bucket": bucket,
+        "candidate_percentage": candidate_percentage,
+        "baseline_version_id": str(baseline.id),
+        "candidate_version_id": str(active_version.id),
+    }
 
 
 def list_organizations(session: Session) -> list[Organization]:
@@ -908,7 +985,9 @@ def create_workflow_version(
         policy_pack_json=[policy.model_dump(mode="json", exclude_none=True) for policy in payload.policy_pack],
         tool_set_json=[tool.model_dump(mode="json", exclude_none=True) for tool in payload.tool_set],
         guardrails_json=list(payload.guardrails),
-        rollout_config_json=payload.rollout_config.model_dump(mode="json") if payload.rollout_config else None,
+        rollout_config_json=(
+            payload.rollout_config.model_dump(mode="json", exclude_none=True) if payload.rollout_config else None
+        ),
         eval_dataset_bindings_json=[str(dataset_id) for dataset_id in payload.eval_dataset_bindings],
         created_by=payload.created_by or actor_user_id,
     )
@@ -993,7 +1072,7 @@ def update_workflow_version(
         version.guardrails_json = list(payload.guardrails)
         changed_fields.append("guardrails")
     if payload.rollout_config is not None:
-        version.rollout_config_json = payload.rollout_config.model_dump(mode="json")
+        version.rollout_config_json = payload.rollout_config.model_dump(mode="json", exclude_none=True)
         changed_fields.append("rollout_config")
     if payload.eval_dataset_bindings is not None:
         version.eval_dataset_bindings_json = [str(dataset_id) for dataset_id in payload.eval_dataset_bindings]
@@ -1096,6 +1175,75 @@ def set_active_workflow_version(
     return workflow
 
 
+def activate_workflow_rollout(
+    session: Session,
+    *,
+    workflow_id: UUID,
+    payload: ActivateWorkflowRolloutRequest,
+    actor_user_id: UUID | None,
+) -> Workflow:
+    workflow = _first_or_404(
+        session,
+        select(Workflow).options(joinedload(Workflow.project)).where(Workflow.id == workflow_id),
+        "workflow not found",
+    )
+    candidate = _first_or_404(
+        session,
+        select(WorkflowVersion).where(WorkflowVersion.id == payload.candidate_version_id),
+        "candidate workflow version not found",
+    )
+    if candidate.workflow_id != workflow.id:
+        raise ConflictError("candidate version does not belong to this workflow")
+    if candidate.status != WorkflowVersionStatus.PUBLISHED:
+        raise ConflictError("only published workflow versions can be activated for rollout")
+
+    config = candidate.rollout_config_json or {}
+    if config.get("strategy") != RolloutStrategy.CANARY.value:
+        raise ConflictError("candidate version must define a canary rollout config")
+    if config.get("candidate_version") != candidate.version:
+        raise ConflictError("rollout candidate_version must match the candidate workflow version")
+    traffic_split = config.get("traffic_split") or {}
+    candidate_percentage = int(traffic_split.get("candidate") or 0)
+    baseline_percentage = int(traffic_split.get("baseline") or 0)
+    if candidate_percentage < 0 or baseline_percentage < 0 or candidate_percentage + baseline_percentage != 100:
+        raise ConflictError("rollout traffic split must add up to 100")
+
+    baseline_version = config.get("baseline_version")
+    if not baseline_version:
+        raise ConflictError("rollout baseline_version is required")
+    baseline = _get_published_workflow_version_by_version(
+        session,
+        workflow_id=workflow.id,
+        version=str(baseline_version),
+    )
+    if baseline is None:
+        raise ConflictError("rollout baseline version must be published")
+    if baseline.id == candidate.id:
+        raise ConflictError("rollout baseline and candidate must be different versions")
+
+    before_json = {"active_version_id": str(workflow.active_version_id) if workflow.active_version_id else None}
+    workflow.active_version_id = candidate.id
+    session.flush()
+
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=workflow.project.org_id,
+        project_id=workflow.project_id,
+        action="workflow.rollout.activate",
+        resource_type="workflow",
+        resource_id=workflow.id,
+        before_json=before_json,
+        after_json={
+            "active_version_id": str(candidate.id),
+            "baseline_version_id": str(baseline.id),
+            "candidate_version_id": str(candidate.id),
+            "traffic_split": traffic_split,
+        },
+    )
+    return workflow
+
+
 def list_runs(session: Session, *, project_id: UUID) -> list[Run]:
     return list(
         session.scalars(select(Run).where(Run.project_id == project_id).order_by(Run.created_at.desc())).all()
@@ -1167,6 +1315,14 @@ def submit_workflow_run(
         )
     if version is None:
         raise NotFoundError("published workflow version not found")
+    routing_context = None
+    if workflow.active_version_id is not None:
+        version, routing_context = _resolve_active_rollout_version(
+            session,
+            workflow=workflow,
+            active_version=version,
+            input_payload=payload.input_payload,
+        )
 
     return _create_run_for_version(
         session,
@@ -1175,6 +1331,7 @@ def submit_workflow_run(
         input_payload=payload.input_payload,
         triggered_by=payload.triggered_by,
         actor_user_id=actor_user_id,
+        routing_context=routing_context,
     )
 
 

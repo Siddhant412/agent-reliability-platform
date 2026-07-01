@@ -399,6 +399,65 @@ def test_workflow_slug_submission_uses_active_version_when_set(client: TestClien
     assert run_response.json()["workflow_version_id"] != second_version_id
 
 
+def test_canary_rollout_activation_routes_slug_runs_to_candidate(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="rollout-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="rollout-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    baseline_version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+        version="1.0.0",
+    )
+
+    candidate_payload = _workflow_version_payload(version="1.1.0")
+    candidate_payload["rollout_config"] = {
+        "strategy": "canary",
+        "baseline_version": "1.0.0",
+        "candidate_version": "1.1.0",
+        "traffic_split": {"baseline": 0, "candidate": 100},
+        "rollback_thresholds": {"schema_failure_rate": 0.01},
+    }
+    candidate_response = client.post(
+        f"/api/v1/workflows/{workflow_id}/versions",
+        json=candidate_payload,
+        headers=owner,
+    )
+    assert candidate_response.status_code == 201
+    candidate_version_id = candidate_response.json()["id"]
+    publish_candidate_response = client.post(
+        f"/api/v1/workflow-versions/{candidate_version_id}/publish",
+        json={"published_by": owner["X-Actor-User-Id"]},
+        headers=owner,
+    )
+    assert publish_candidate_response.status_code == 200
+
+    activate_response = client.post(
+        f"/api/v1/workflows/{workflow_id}/rollout/activate",
+        json={"candidate_version_id": candidate_version_id},
+        headers=owner,
+    )
+    assert activate_response.status_code == 200
+    assert activate_response.json()["active_version_id"] == candidate_version_id
+
+    run_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-ROLL-1",
+                "customer_id": "C-200",
+                "message": "Where is my order?",
+            },
+        },
+        headers=owner,
+    )
+    assert run_response.status_code == 201
+    assert run_response.json()["workflow_version_id"] == candidate_version_id
+    assert run_response.json()["workflow_version_id"] != baseline_version_id
+
+
 def test_support_demo_connector_seed_and_tool_registry(client: TestClient) -> None:
     owner = _headers()
 
@@ -713,10 +772,17 @@ def test_eval_run_executes_dataset_and_records_case_results(client: TestClient) 
     org_id = _create_org(client, actor_headers=owner, slug="eval-corp")
     project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="eval-ops")
     workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
-    version_id = _create_and_publish_workflow_version(
+    baseline_version_id = _create_and_publish_workflow_version(
         client,
         workflow_id=workflow_id,
         actor_headers=owner,
+        version="1.0.0",
+    )
+    candidate_version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+        version="1.1.0",
     )
 
     dataset_response = client.post(
@@ -758,7 +824,11 @@ def test_eval_run_executes_dataset_and_records_case_results(client: TestClient) 
 
     create_eval_response = client.post(
         f"/api/v1/projects/{project_id}/eval-runs",
-        json={"dataset_id": dataset_id, "workflow_version_id": version_id},
+        json={
+            "dataset_id": dataset_id,
+            "workflow_version_id": candidate_version_id,
+            "baseline_version_id": baseline_version_id,
+        },
         headers=owner,
     )
     assert create_eval_response.status_code == 201
@@ -773,13 +843,20 @@ def test_eval_run_executes_dataset_and_records_case_results(client: TestClient) 
     assert executed["summary"]["failed"] == 1
     assert executed["summary"]["schema_valid"] == 1
     assert executed["summary"]["success_rate"] == 0.5
+    assert executed["summary"]["baseline_succeeded"] == 1
+    assert executed["summary"]["baseline_failed"] == 1
+    assert executed["summary"]["baseline_success_rate"] == 0.5
+    assert executed["summary"]["unchanged"] == 2
 
     results_response = client.get(f"/api/v1/projects/{project_id}/eval-runs/{eval_run_id}/results", headers=owner)
     assert results_response.status_code == 200
     results = results_response.json()
     assert len(results) == 2
     assert {record["status"] for record in results} == {"succeeded", "failed"}
-    assert next(record for record in results if record["status"] == "succeeded")["run_id"] is not None
+    succeeded_result = next(record for record in results if record["status"] == "succeeded")
+    assert succeeded_result["run_id"] is not None
+    assert succeeded_result["scores"]["baseline"]["run_succeeded"] is True
+    assert succeeded_result["scores"]["comparison"] == "unchanged"
     failed_result = next(record for record in results if record["status"] == "failed" and record["run_id"] is None)
     assert "message" in failed_result["error"]
 

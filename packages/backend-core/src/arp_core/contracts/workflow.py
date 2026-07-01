@@ -98,6 +98,10 @@ class SetActiveWorkflowVersionRequest(BaseModel):
     workflow_version_id: UUID
 
 
+class ActivateWorkflowRolloutRequest(BaseModel):
+    candidate_version_id: UUID
+
+
 class WorkflowVersionCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
