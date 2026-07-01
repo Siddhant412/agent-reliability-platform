@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from arp_core.contracts.approval import ApprovalRequestRead
+from arp_core.contracts.audit import AuditEventRead
 from arp_core.contracts.eval import DatasetRead, EvalCaseRead, EvalCaseResultRead, EvalRunRead
 from arp_core.contracts.run import RunRead, ToolCallRead, TraceSpanRead
 from arp_core.contracts.tenant import MembershipRead, OrganizationRead, ProjectRead
@@ -17,6 +18,7 @@ from arp_core.contracts.workflow import (
 )
 from arp_core.persistence.models import (
     ApprovalRequest,
+    AuditEvent,
     Connector,
     Dataset,
     EvalCase,
@@ -147,6 +149,21 @@ def approval_request_to_read(record: ApprovalRequest) -> ApprovalRequestRead:
         decided_at=record.decided_at,
         decided_by=record.decided_by,
         decision_note=record.decision_note,
+    )
+
+
+def audit_event_to_read(record: AuditEvent) -> AuditEventRead:
+    return AuditEventRead(
+        id=record.id,
+        actor_user_id=record.actor_user_id,
+        org_id=record.org_id,
+        project_id=record.project_id,
+        action=record.action,
+        resource_type=record.resource_type,
+        resource_id=record.resource_id,
+        before=record.before_json,
+        after=record.after_json,
+        created_at=record.created_at,
     )
 
 

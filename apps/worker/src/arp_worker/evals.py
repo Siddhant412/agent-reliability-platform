@@ -4,17 +4,20 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from arp_core.application import services
 from arp_core.application.exceptions import ApplicationError
 from arp_core.contracts.run import RunSubmitRequest
 from arp_core.domain.enums import ApprovalStatus, EvalCaseStatus, EvalRunStatus, RunStatus, ToolCallStatus
+from arp_core.persistence.models import Dataset, EvalRun
 from arp_worker.runner import execute_run
 
 
 @dataclass(frozen=True)
 class EvalExecutionResult:
+    project_id: UUID
     eval_run_id: UUID
     status: EvalRunStatus
     summary: dict[str, Any]
@@ -127,7 +130,30 @@ def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -
         )
         raise
 
-    return EvalExecutionResult(eval_run_id=eval_run.id, status=eval_run.status, summary=eval_run.summary_json)
+    return EvalExecutionResult(
+        project_id=project_id,
+        eval_run_id=eval_run.id,
+        status=eval_run.status,
+        summary=eval_run.summary_json,
+    )
+
+
+def execute_next_queued_eval_run(session: Session, *, project_id: UUID | None = None) -> EvalExecutionResult | None:
+    statement = (
+        select(EvalRun)
+        .join(Dataset, Dataset.id == EvalRun.dataset_id)
+        .where(EvalRun.status == EvalRunStatus.QUEUED)
+        .order_by(EvalRun.created_at)
+    )
+    if project_id is not None:
+        statement = statement.where(Dataset.project_id == project_id)
+    eval_run = session.scalar(statement)
+    if eval_run is None:
+        return None
+    eval_project_id = session.scalar(select(Dataset.project_id).where(Dataset.id == eval_run.dataset_id))
+    if eval_project_id is None:
+        return None
+    return execute_eval_run(session, project_id=eval_project_id, eval_run_id=eval_run.id)
 
 
 def _execute_eval_case(

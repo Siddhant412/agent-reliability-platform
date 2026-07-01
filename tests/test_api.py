@@ -497,6 +497,39 @@ def test_support_demo_connector_seed_and_tool_registry(client: TestClient) -> No
     assert [tool["name"] for tool in tools_response.json()] == sorted(tool["name"] for tool in seeded_tools)
 
 
+def test_project_audit_events_are_filterable_and_tenant_scoped(client: TestClient) -> None:
+    owner = _headers()
+    outsider = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="audit-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="audit-ops")
+
+    dataset_response = client.post(
+        f"/api/v1/projects/{project_id}/datasets",
+        json={"name": "audit-smoke", "version": "1.0.0"},
+        headers=owner,
+    )
+    assert dataset_response.status_code == 201
+    dataset_id = dataset_response.json()["id"]
+
+    forbidden_response = client.get(f"/api/v1/projects/{project_id}/audit-events", headers=outsider)
+    assert forbidden_response.status_code == 403
+
+    filtered_response = client.get(
+        f"/api/v1/projects/{project_id}/audit-events",
+        params={"action": "dataset.create", "resource_type": "dataset"},
+        headers=owner,
+    )
+    assert filtered_response.status_code == 200
+    events = filtered_response.json()
+    assert len(events) == 1
+    assert events[0]["action"] == "dataset.create"
+    assert events[0]["resource_type"] == "dataset"
+    assert events[0]["resource_id"] == dataset_id
+    assert events[0]["actor_user_id"] == owner["X-Actor-User-Id"]
+    assert events[0]["after"] == {"name": "audit-smoke", "version": "1.0.0"}
+
+
 def test_run_status_transitions_and_trace_span_writes(client: TestClient) -> None:
     owner = _headers()
 

@@ -7,10 +7,12 @@ from sqlalchemy.orm import Session
 
 from arp_core.application import services
 from arp_core.application.exceptions import ConflictError
+from arp_core.contracts.eval import DatasetCreate, EvalCaseCreate, EvalRunCreate
 from arp_core.contracts.run import WorkflowRunSubmitRequest
 from arp_core.contracts.tenant import OrganizationCreate, ProjectCreate
 from arp_core.contracts.workflow import PublishWorkflowVersionRequest, WorkflowCreate, WorkflowVersionCreate
 from arp_core.domain.enums import ApprovalStatus, MembershipRole, RunStatus, SpanStatus, ToolCallStatus
+from arp_worker.queue import process_next_work_item
 from arp_worker.runner import execute_next_queued_run, execute_run
 
 
@@ -302,6 +304,46 @@ def test_deterministic_worker_fails_when_final_output_violates_schema(db_session
 
 def test_deterministic_worker_returns_none_when_no_queued_runs(db_session: Session) -> None:
     assert execute_next_queued_run(db_session) is None
+
+
+def test_queue_processor_executes_next_queued_eval_run(db_session: Session) -> None:
+    project, version, run = _create_queued_run(db_session, message="Where is my order?")
+    execute_run(db_session, project_id=project.id, run_id=run.id)
+    dataset = services.create_dataset(
+        db_session,
+        project_id=project.id,
+        payload=DatasetCreate(name="worker-eval", version="1.0.0"),
+        actor_user_id=None,
+    )
+    services.create_eval_case(
+        db_session,
+        project_id=project.id,
+        dataset_id=dataset.id,
+        payload=EvalCaseCreate(
+            input_payload={
+                "ticket_id": "T-EVAL",
+                "customer_id": "C-200",
+                "message": "Where is my order?",
+            }
+        ),
+    )
+    eval_run = services.create_eval_run(
+        db_session,
+        project_id=project.id,
+        payload=EvalRunCreate(dataset_id=dataset.id, workflow_version_id=version.id),
+        actor_user_id=None,
+    )
+
+    result = process_next_work_item(db_session, project_id=project.id, queue_kind="all")
+
+    assert result is not None
+    assert result.work_type == "eval_run"
+    assert result.project_id == project.id
+    assert result.resource_id == eval_run.id
+    assert result.status == "succeeded"
+    db_session.refresh(eval_run)
+    assert eval_run.status.value == "succeeded"
+    assert eval_run.summary_json["total_cases"] == 1
 
 
 def test_deterministic_worker_pauses_for_refund_approval_and_resumes(db_session: Session) -> None:

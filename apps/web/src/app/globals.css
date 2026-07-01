@@ -189,10 +189,15 @@ code {
   grid-column: span 2;
 }
 
+.auditPanel {
+  grid-column: span 3;
+}
+
 .runList,
 .approvalList,
 .toolList,
 .evalList,
+.auditList,
 .callList,
 .timeline {
   display: grid;
@@ -299,6 +304,7 @@ code {
 .approvalTitle,
 .callTitle,
 .evalTitle,
+.auditTitle,
 .connectorTitle,
 .toolRow {
   align-items: center;
@@ -321,6 +327,7 @@ code {
 .approvalRow,
 .connectorRow,
 .evalRow,
+.auditRow,
 .callRow {
   border-bottom: 1px solid var(--line);
   display: grid;
@@ -342,6 +349,15 @@ code {
 .decisionButtons {
   display: flex;
   gap: 6px;
+}
+
+.auditTitle {
+  justify-content: space-between;
+}
+
+.auditMeta {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .toolRow {
@@ -412,7 +428,8 @@ code {
   }
 
   .timelinePanel,
-  .callsPanel {
+  .callsPanel,
+  .auditPanel {
     grid-column: span 2;
   }
 }
@@ -430,7 +447,8 @@ code {
   }
 
   .timelinePanel,
-  .callsPanel {
+  .callsPanel,
+  .auditPanel {
     grid-column: span 1;
   }
 

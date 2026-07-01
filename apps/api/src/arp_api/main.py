@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from arp_api.routes.approvals import router as approvals_router
+from arp_api.routes.audit import router as audit_router
 from arp_api.routes.auth import router as auth_router
 from arp_api.routes.connectors import router as connectors_router
 from arp_api.routes.evals import router as evals_router
@@ -59,6 +60,7 @@ def create_app(*, database_url: str | None = None) -> FastAPI:
     app.include_router(runs_router)
     app.include_router(approvals_router)
     app.include_router(evals_router)
+    app.include_router(audit_router)
     return app
 
 

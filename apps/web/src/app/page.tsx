@@ -10,6 +10,7 @@ import {
   Play,
   RefreshCw,
   RotateCw,
+  ScrollText,
   Search,
   ShieldCheck,
   Split,
@@ -125,6 +126,17 @@ type EvalCaseResult = {
   error: Record<string, unknown> | null;
 };
 
+type AuditEvent = {
+  id: string;
+  actor_user_id: string | null;
+  action: string;
+  resource_type: string;
+  resource_id: string | null;
+  before: Record<string, unknown> | null;
+  after: Record<string, unknown> | null;
+  created_at: string;
+};
+
 type Timeline = {
   run: RunRecord;
   trace_spans: TraceSpan[];
@@ -182,6 +194,7 @@ export default function ConsolePage() {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
   const [evalResults, setEvalResults] = useState<EvalCaseResult[]>([]);
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -271,9 +284,22 @@ export default function ConsolePage() {
     }
   }, [actorUserId, projectId]);
 
+  const loadAuditEvents = useCallback(async () => {
+    if (!projectId) return;
+    setBusy("audit");
+    setError(null);
+    try {
+      setAuditEvents(await api<AuditEvent[]>(`/api/v1/projects/${projectId}/audit-events?limit=20`, actorUserId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load audit events");
+    } finally {
+      setBusy(null);
+    }
+  }, [actorUserId, projectId]);
+
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadRuns(), loadApprovals(), loadConnectors(), loadEvals()]);
-  }, [loadApprovals, loadConnectors, loadEvals, loadRuns]);
+    await Promise.all([loadRuns(), loadApprovals(), loadConnectors(), loadEvals(), loadAuditEvents()]);
+  }, [loadApprovals, loadAuditEvents, loadConnectors, loadEvals, loadRuns]);
 
   async function selectRun(runId: string) {
     setBusy(runId);
@@ -636,6 +662,35 @@ export default function ConsolePage() {
                   <span className={`pill ${statusClass(call.status)}`}>{call.status}</span>
                 </div>
                 <pre>{previewJson(call.result ?? call.error ?? call.args)}</pre>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel auditPanel">
+          <div className="panelHeader">
+            <h2>Audit</h2>
+            <div className="headerActions">
+              <button
+                className="iconButton"
+                onClick={loadAuditEvents}
+                disabled={!projectId || busy != null}
+                title="Load audit events"
+              >
+                <ScrollText size={17} />
+              </button>
+              <span>{auditEvents.length}</span>
+            </div>
+          </div>
+          <div className="auditList">
+            {auditEvents.map((event) => (
+              <div className="auditRow" key={event.id}>
+                <div className="auditTitle">
+                  <span className="pill idle">{event.action}</span>
+                  <code>{event.resource_type}</code>
+                </div>
+                <span className="auditMeta">{new Date(event.created_at).toLocaleString()}</span>
+                <pre>{previewJson(event.after ?? event.before)}</pre>
               </div>
             ))}
           </div>

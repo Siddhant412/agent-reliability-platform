@@ -13,8 +13,17 @@ Current implementation:
   deterministically.
 - `arp_worker.runner.execute_next_queued_run` picks the oldest queued run,
   optionally within a project.
-- `arp-worker-run --project-id <uuid> [--run-id <uuid>]` runs the local worker
-  against `ARP_DATABASE_URL` or `.arp/dev.db`.
+- `arp_worker.evals.execute_next_queued_eval_run` picks the oldest queued eval
+  run and executes its dataset.
+- `arp_worker.queue.process_work_queue` processes queued runs and eval runs in
+  one local queue loop.
+- `arp-worker-run --project-id <uuid> [--run-id <uuid>]` runs a specific run.
+- `arp-worker-run --project-id <uuid> --eval-run-id <uuid>` runs a specific
+  eval run.
+- `arp-worker-run --project-id <uuid> --queue-kind all --max-items 10` drains
+  queued work once.
+- `arp-worker-run --project-id <uuid> --queue-kind all --poll` keeps polling
+  for queued work.
 
 This is intentionally not a Temporal worker yet. It validates the persistence
 contract first: `queued -> running -> succeeded/failed`, approval pause/resume,

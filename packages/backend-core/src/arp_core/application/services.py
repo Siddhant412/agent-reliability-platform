@@ -46,6 +46,7 @@ from arp_core.domain.enums import (
 from arp_core.persistence.base import utcnow
 from arp_core.persistence.models import (
     ApprovalRequest,
+    AuditEvent,
     Connector,
     Dataset,
     EvalCase,
@@ -591,6 +592,28 @@ def get_connector(session: Session, *, project_id: UUID, connector_id: UUID) -> 
         select(Connector).where(Connector.project_id == project_id, Connector.id == connector_id),
         "connector not found",
     )
+
+
+def list_audit_events(
+    session: Session,
+    *,
+    project_id: UUID,
+    action: str | None = None,
+    resource_type: str | None = None,
+    resource_id: UUID | None = None,
+    actor_user_id: UUID | None = None,
+    limit: int = 50,
+) -> list[AuditEvent]:
+    statement = select(AuditEvent).where(AuditEvent.project_id == project_id)
+    if action is not None:
+        statement = statement.where(AuditEvent.action == action)
+    if resource_type is not None:
+        statement = statement.where(AuditEvent.resource_type == resource_type)
+    if resource_id is not None:
+        statement = statement.where(AuditEvent.resource_id == resource_id)
+    if actor_user_id is not None:
+        statement = statement.where(AuditEvent.actor_user_id == actor_user_id)
+    return list(session.scalars(statement.order_by(AuditEvent.created_at.desc()).limit(limit)).all())
 
 
 def list_tool_definitions(session: Session, *, project_id: UUID, connector_id: UUID) -> list[ToolDefinition]:
