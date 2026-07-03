@@ -1,5 +1,12 @@
 ## Tree
 
+This plan includes both current implementation boundaries and target production
+boundaries. Current MVP code is local and deterministic: the API queues work,
+SQLAlchemy persists state, the Next.js console drives workflows/evals/rollouts,
+and `arp-worker-run` processes queued runs and eval runs. Temporal workflows,
+OpenAI Agents SDK adapters, MCP servers, and full infrastructure services are
+planned target layers.
+
 ```text
 .
 |-- README.md
@@ -60,19 +67,25 @@ Rules:
 
 ### `apps/worker`
 
-Temporal worker process for runtime, approvals, evals, and rollout monitors.
+Current deterministic worker process and future Temporal worker boundary for
+runtime, approvals, evals, and rollout monitors.
 
 Planned modules:
 
 - `src/arp_worker/main.py` - worker bootstrap.
+- `src/arp_worker/queue.py` - current local queue processor.
+- `src/arp_worker/runner.py` - current deterministic run executor.
+- `src/arp_worker/evals.py` - current deterministic eval executor.
 - `src/arp_worker/workflows/` - Temporal workflow definitions.
 - `src/arp_worker/activities/` - activity adapters for model calls, tools,
   policy checks, persistence, and grading.
 
 Rules:
 
-- Temporal workflows own orchestration and durable waits.
-- Activities should call shared interfaces from `packages/backend-core`.
+- In the current MVP, the local worker owns orchestration for queued work.
+- In the target architecture, Temporal workflows own orchestration and durable
+  waits.
+- Worker code should call shared interfaces from `packages/backend-core`.
 - Worker payloads must carry run/version IDs, not mutable prompt/tool config
   blobs, so execution always reloads the pinned version.
 

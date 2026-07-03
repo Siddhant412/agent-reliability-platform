@@ -1,5 +1,42 @@
 ## Logical architecture
 
+This document describes the target production architecture. The current
+implementation is a deterministic local MVP: FastAPI + SQLAlchemy persistence,
+Next.js console, local support-demo tools, explicit queue APIs, and
+`arp-worker-run` for queued run/eval processing. Temporal, OpenAI Agents SDK,
+MCP servers, Redis, MinIO/S3, and OpenTelemetry export are planned integration
+layers, not prerequisites for the current local demo.
+
+## Current MVP Architecture
+
+```text
+Browser / API clients
+  |
+  | X-Actor-User-Id + project/workflow IDs
+  v
+Next.js Web Console
+  |
+  | typed HTTP API
+  v
+FastAPI Control Plane
+  |
+  v
+SQLite/Postgres-compatible SQLAlchemy persistence
+  |
+  v
+Local deterministic worker CLI
+  |
+  v
+Tool Gateway interface -> support-demo local tools
+```
+
+Current worker execution is queue-first: API handlers create queued work and
+the local worker processes queued runs/eval runs through `arp-worker-run`.
+Inline execute endpoints still exist for tests and development shortcuts, but
+they are not the default product flow.
+
+## Target Architecture
+
 ```text
 Browser / API clients
   |

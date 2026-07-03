@@ -15,7 +15,7 @@ from arp_core.application.policies import evaluate_policy_pack
 from arp_core.contracts.run import RunTransitionRequest, ToolCallCreate, ToolCallUpdate, TraceSpanCreate
 from arp_core.domain.enums import PolicyAction, RunStatus, SpanStatus, ToolCallStatus
 from arp_core.persistence.models import Run, ToolCall, WorkflowVersion
-from arp_support_demo.tools import SupportToolError, execute_tool
+from arp_core.tools.gateway import LocalSupportToolGateway, ToolExecutionRequest, ToolGateway, ToolGatewayError
 
 
 class DeterministicWorkerError(Exception):
@@ -179,10 +179,13 @@ def _execute_tool_call(
     tool_name: str,
     args: dict[str, Any],
     parent_span_id: str | None,
+    tool_gateway: ToolGateway,
 ) -> dict[str, Any]:
     try:
-        result = execute_tool(tool_name, args)
-    except SupportToolError as exc:
+        result = tool_gateway.execute(
+            ToolExecutionRequest(project_id=project_id, run_id=run_id, tool_name=tool_name, args=args)
+        )
+    except ToolGatewayError as exc:
         execute_span = _span(
             run_id=run_id,
             trace_id=trace_id,
@@ -191,7 +194,7 @@ def _execute_tool_call(
             status=SpanStatus.ERROR,
             parent_span_id=parent_span_id,
             attributes={"tool_name": tool_name},
-            error={"type": exc.__class__.__name__, "message": str(exc)},
+            error={"type": exc.error_type, "message": str(exc)},
         )
         _emit_span(session, project_id=project_id, run_id=run_id, payload=execute_span)
         services.update_tool_call(
@@ -201,7 +204,7 @@ def _execute_tool_call(
             payload=ToolCallUpdate(
                 status=ToolCallStatus.FAILED,
                 span_id=execute_span.span_id,
-                error={"type": exc.__class__.__name__, "message": str(exc)},
+                error={"type": exc.error_type, "message": str(exc)},
             ),
         )
         raise
@@ -233,6 +236,7 @@ def _run_support_tool(
     trace_id: str,
     tool_name: str,
     args: dict[str, Any],
+    tool_gateway: ToolGateway,
 ) -> dict[str, Any]:
     proposed_span = _span(
         run_id=run_id,
@@ -259,6 +263,7 @@ def _run_support_tool(
         tool_name=tool_name,
         args=args,
         parent_span_id=proposed_span.span_id,
+        tool_gateway=tool_gateway,
     )
 
 
@@ -269,6 +274,7 @@ def _run_policy_gated_tool(
     trace_id: str,
     tool_name: str,
     args: dict[str, Any],
+    tool_gateway: ToolGateway,
 ) -> str:
     proposed_span = _span(
         run_id=run.id,
@@ -381,6 +387,7 @@ def _run_policy_gated_tool(
         tool_name=tool_name,
         args=args,
         parent_span_id=proposed_span.span_id,
+        tool_gateway=tool_gateway,
     )
     return "executed"
 
@@ -393,7 +400,7 @@ def _persisted_tool_results(session: Session, *, project_id: UUID, run_id: UUID)
     }
 
 
-def _execute_approved_tool_calls(session: Session, *, run: Run, trace_id: str) -> None:
+def _execute_approved_tool_calls(session: Session, *, run: Run, trace_id: str, tool_gateway: ToolGateway) -> None:
     for tool_call in services.list_tool_calls(session, project_id=run.project_id, run_id=run.id):
         if tool_call.status != ToolCallStatus.APPROVED:
             continue
@@ -406,6 +413,7 @@ def _execute_approved_tool_calls(session: Session, *, run: Run, trace_id: str) -
             tool_name=tool_call.tool_name,
             args=tool_call.args_json,
             parent_span_id=tool_call.span_id,
+            tool_gateway=tool_gateway,
         )
 
 
@@ -537,8 +545,15 @@ def _token_count(value: Any) -> int:
     return len(str(value).split())
 
 
-def execute_run(session: Session, *, project_id: UUID, run_id: UUID) -> WorkerExecutionResult:
+def execute_run(
+    session: Session,
+    *,
+    project_id: UUID,
+    run_id: UUID,
+    tool_gateway: ToolGateway | None = None,
+) -> WorkerExecutionResult:
     run = _load_executable_run(session, project_id=project_id, run_id=run_id)
+    gateway = tool_gateway or LocalSupportToolGateway()
     trace_id = _stable_hex(f"run:{run.id}", length=32)
     workflow = run.workflow_version.workflow
     is_resumed = run.status == RunStatus.RESUMED
@@ -582,7 +597,7 @@ def execute_run(session: Session, *, project_id: UUID, run_id: UUID) -> WorkerEx
         )
 
         if is_resumed:
-            _execute_approved_tool_calls(session, run=run, trace_id=trace_id)
+            _execute_approved_tool_calls(session, run=run, trace_id=trace_id, tool_gateway=gateway)
             tool_results = _persisted_tool_results(session, project_id=project_id, run_id=run_id)
             final_output = _build_output(
                 run,
@@ -600,6 +615,7 @@ def execute_run(session: Session, *, project_id: UUID, run_id: UUID) -> WorkerEx
                 trace_id=trace_id,
                 tool_name=tool_name,
                 args=args,
+                tool_gateway=gateway,
             )
 
         for tool_name, args in _mutating_tool_plan(run, tool_results):
@@ -609,6 +625,7 @@ def execute_run(session: Session, *, project_id: UUID, run_id: UUID) -> WorkerEx
                 trace_id=trace_id,
                 tool_name=tool_name,
                 args=args,
+                tool_gateway=gateway,
             )
             if outcome == "awaiting_approval":
                 return WorkerExecutionResult(
@@ -622,7 +639,8 @@ def execute_run(session: Session, *, project_id: UUID, run_id: UUID) -> WorkerEx
 
         final_output = _build_output(run, tool_results)
         return _finish_run(session, run=run, trace_id=trace_id, final_output=final_output)
-    except (DeterministicWorkerError, SupportToolError) as exc:
+    except (DeterministicWorkerError, ToolGatewayError) as exc:
+        error_type = exc.error_type if isinstance(exc, ToolGatewayError) else exc.__class__.__name__
         _emit_span(
             session,
             project_id=project_id,
@@ -633,7 +651,7 @@ def execute_run(session: Session, *, project_id: UUID, run_id: UUID) -> WorkerEx
                 span_type="run.finish",
                 name="run.finish",
                 status=SpanStatus.ERROR,
-                error={"type": exc.__class__.__name__, "message": str(exc)},
+                error={"type": error_type, "message": str(exc)},
             ),
         )
         run = services.transition_run_status(
@@ -652,8 +670,13 @@ def execute_run(session: Session, *, project_id: UUID, run_id: UUID) -> WorkerEx
         )
 
 
-def execute_next_queued_run(session: Session, *, project_id: UUID | None = None) -> WorkerExecutionResult | None:
+def execute_next_queued_run(
+    session: Session,
+    *,
+    project_id: UUID | None = None,
+    tool_gateway: ToolGateway | None = None,
+) -> WorkerExecutionResult | None:
     run = _next_queued_run(session, project_id=project_id)
     if run is None:
         return None
-    return execute_run(session, project_id=run.project_id, run_id=run.id)
+    return execute_run(session, project_id=run.project_id, run_id=run.id, tool_gateway=tool_gateway)

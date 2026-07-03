@@ -10,7 +10,6 @@ import {
   ListFilter,
   Play,
   RefreshCw,
-  RotateCw,
   ScrollText,
   Search,
   ShieldCheck,
@@ -241,7 +240,9 @@ export default function ConsolePage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const selectedRunId = timeline?.run.id ?? runs[0]?.id ?? "";
+  const selectedRun = timeline?.run ?? runs[0] ?? null;
+  const selectedRunId = selectedRun?.id ?? "";
+  const canQueueSelectedRun = selectedRun?.status === "queued" || selectedRun?.status === "resumed";
   const selectedWorkflowVersionId =
     selectedVersionId || timeline?.run.workflow_version_id || runs[0]?.workflow_version_id || "";
   const selectedWorkflow = workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? workflows[0] ?? null;
@@ -400,20 +401,6 @@ export default function ConsolePage() {
       setTimeline(await api<Timeline>(`/api/v1/projects/${projectId}/runs/${runId}/timeline`, actorUserId));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load timeline");
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function executeRun(runId: string) {
-    setBusy("execute");
-    setError(null);
-    try {
-      await api<RunRecord>(`/api/v1/projects/${projectId}/runs/${runId}/execute`, actorUserId, { method: "POST" });
-      await refreshAll();
-      await selectRun(runId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to execute run");
     } finally {
       setBusy(null);
     }
@@ -687,18 +674,10 @@ export default function ConsolePage() {
               <button
                 className="iconButton"
                 onClick={() => selectedRunId && enqueueRun(selectedRunId)}
-                disabled={!selectedRunId || busy != null}
-                title="Enqueue"
+                disabled={!selectedRunId || !canQueueSelectedRun || busy != null}
+                title="Queue for worker"
               >
                 <Play size={17} />
-              </button>
-              <button
-                className="iconButton"
-                onClick={() => selectedRunId && executeRun(selectedRunId)}
-                disabled={!selectedRunId || busy != null}
-                title="Execute inline"
-              >
-                <RotateCw size={17} />
               </button>
               <span>{timeline?.trace_spans.length ?? 0}</span>
             </div>

@@ -1,11 +1,11 @@
 # `apps/worker`
 
-Temporal worker service for workflow execution, approval pause/resume, offline
-evals, and rollout monitoring.
+Deterministic local worker for workflow execution, approval pause/resume,
+offline evals, and rollout monitoring. This package is also the future Temporal
+worker boundary.
 
-Workflow and activity implementations should load pinned workflow versions from
-Postgres and call shared domain/policy/tool interfaces from
-`packages/backend-core`.
+Worker implementations load pinned workflow versions from persistence and call
+shared domain, policy, and tool gateway interfaces from `packages/backend-core`.
 
 Current implementation:
 
@@ -32,3 +32,7 @@ trace span writes, and deterministic structured output.
 The deterministic worker calls the support-demo tools, persists each call in
 `tool_calls`, creates approval requests for policy-gated mutating actions, and
 validates final output against the pinned workflow version schema.
+
+Tool execution goes through `arp_core.tools.gateway.ToolGateway`. The default
+local adapter uses support-demo tools, and future MCP/external adapters should
+implement the same gateway boundary.

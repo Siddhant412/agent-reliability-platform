@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -12,6 +13,7 @@ from arp_core.contracts.run import WorkflowRunSubmitRequest
 from arp_core.contracts.tenant import OrganizationCreate, ProjectCreate
 from arp_core.contracts.workflow import PublishWorkflowVersionRequest, WorkflowCreate, WorkflowVersionCreate
 from arp_core.domain.enums import ApprovalStatus, MembershipRole, RunStatus, SpanStatus, ToolCallStatus
+from arp_core.tools.gateway import ToolExecutionRequest
 from arp_worker.queue import process_next_work_item
 from arp_worker.runner import execute_next_queued_run, execute_run
 
@@ -180,6 +182,42 @@ def _create_approval_queued_run(session: Session):
     return project, version, run
 
 
+class RecordingToolGateway:
+    def __init__(self) -> None:
+        self.calls: list[ToolExecutionRequest] = []
+
+    def execute(self, request: ToolExecutionRequest) -> dict[str, Any]:
+        self.calls.append(request)
+        if request.tool_name == "kb_search":
+            return {
+                "query": request.args.get("query", ""),
+                "articles": [
+                    {
+                        "article_id": "KB-GATEWAY",
+                        "title": "Gateway article",
+                        "summary": "A deterministic gateway article.",
+                        "tags": ["gateway"],
+                    }
+                ],
+            }
+        if request.tool_name == "get_customer_profile":
+            return {
+                "customer_id": request.args.get("customer_id", ""),
+                "name": "Gateway Customer",
+                "tier": "standard",
+            }
+        if request.tool_name == "get_order":
+            return {
+                "order_id": "O-GATEWAY",
+                "customer_id": request.args.get("customer_id", ""),
+                "status": "processing",
+                "total_usd": 10.0,
+            }
+        if request.tool_name == "post_ticket_comment":
+            return {"status": "posted"}
+        raise AssertionError(f"unexpected tool call: {request.tool_name}")
+
+
 def test_deterministic_worker_executes_next_queued_run(db_session: Session) -> None:
     project, version, run = _create_queued_run(db_session)
 
@@ -237,6 +275,26 @@ def test_deterministic_worker_executes_next_queued_run(db_session: Session) -> N
 
     with pytest.raises(ConflictError, match="worker can only execute queued or resumed runs"):
         execute_run(db_session, project_id=project.id, run_id=run.id)
+
+
+def test_worker_executes_tools_through_gateway_boundary(db_session: Session) -> None:
+    project, _, run = _create_queued_run(db_session, message="Where is my order?")
+    gateway = RecordingToolGateway()
+
+    result = execute_run(db_session, project_id=project.id, run_id=run.id, tool_gateway=gateway)
+
+    assert result.status == RunStatus.SUCCEEDED
+    assert [call.tool_name for call in gateway.calls] == [
+        "kb_search",
+        "get_customer_profile",
+        "get_order",
+    ]
+    assert {call.project_id for call in gateway.calls} == {project.id}
+    assert {call.run_id for call in gateway.calls} == {run.id}
+    db_session.refresh(run)
+    assert run.final_output_json is not None
+    assert "Gateway Customer" in run.final_output_json["summary"]
+    assert "Gateway article" in run.final_output_json["summary"]
 
 
 def test_deterministic_worker_marks_failed_tool_call_and_run_failure(db_session: Session) -> None:
