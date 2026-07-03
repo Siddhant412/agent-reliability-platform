@@ -156,6 +156,23 @@ def execute_eval(
     return eval_run_to_read(services.get_eval_run(session, project_id=project_id, eval_run_id=eval_run_id))
 
 
+@router.post("/api/v1/projects/{project_id}/eval-runs/{eval_run_id}/enqueue", response_model=EvalRunRead)
+def enqueue_eval(
+    project_id: UUID,
+    eval_run_id: UUID,
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    actor: Annotated[AuthenticatedActor, Depends(get_authenticated_actor)],
+    session: Annotated[Session, Depends(get_db_session)],
+) -> EvalRunRead:
+    eval_run = services.enqueue_eval_run(
+        session,
+        project_id=project_id,
+        eval_run_id=eval_run_id,
+        actor_user_id=actor.user_id,
+    )
+    return eval_run_to_read(eval_run)
+
+
 @router.get(
     "/api/v1/projects/{project_id}/eval-runs/{eval_run_id}/results",
     response_model=list[EvalCaseResultRead],

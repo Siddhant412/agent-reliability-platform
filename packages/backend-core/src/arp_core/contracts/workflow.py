@@ -102,6 +102,21 @@ class ActivateWorkflowRolloutRequest(BaseModel):
     candidate_version_id: UUID
 
 
+class RolloutMonitorRead(BaseModel):
+    workflow_id: UUID
+    active_version_id: UUID | None = None
+    baseline_version_id: UUID | None = None
+    candidate_version_id: UUID | None = None
+    decision: str
+    thresholds_breached: list[str] = Field(default_factory=list)
+    candidate_runs: int = 0
+    baseline_runs: int = 0
+    candidate_failure_rate: float | None = None
+    baseline_failure_rate: float | None = None
+    candidate_p95_latency_ms: int | None = None
+    baseline_p95_latency_ms: int | None = None
+
+
 class WorkflowVersionCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

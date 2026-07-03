@@ -97,6 +97,18 @@ def execute_run(
     return run_to_read(run)
 
 
+@router.post("/api/v1/projects/{project_id}/runs/{run_id}/enqueue", response_model=RunRead)
+def enqueue_run(
+    project_id: UUID,
+    run_id: UUID,
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    session: Annotated[Session, Depends(get_db_session)],
+    actor: Annotated[AuthenticatedActor, Depends(get_authenticated_actor)],
+) -> RunRead:
+    run = services.enqueue_run(session, project_id=project_id, run_id=run_id, actor_user_id=actor.user_id)
+    return run_to_read(run)
+
+
 @router.get("/api/v1/projects/{project_id}/runs/{run_id}/trace-spans", response_model=list[TraceSpanRead])
 def list_trace_spans(
     project_id: UUID,

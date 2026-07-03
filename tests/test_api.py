@@ -399,6 +399,42 @@ def test_workflow_slug_submission_uses_active_version_when_set(client: TestClien
     assert run_response.json()["workflow_version_id"] != second_version_id
 
 
+def test_run_enqueue_endpoint_preserves_queued_run_for_worker(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="enqueue-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="enqueue-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    version_id = _create_and_publish_workflow_version(client, workflow_id=workflow_id, actor_headers=owner)
+
+    run_response = client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={
+            "workflow_version_id": version_id,
+            "input_payload": {
+                "ticket_id": "T-ENQ",
+                "customer_id": "C-200",
+                "message": "Where is my order?",
+            },
+        },
+        headers=owner,
+    )
+    assert run_response.status_code == 201
+    run_id = run_response.json()["id"]
+
+    enqueue_response = client.post(f"/api/v1/projects/{project_id}/runs/{run_id}/enqueue", headers=owner)
+    assert enqueue_response.status_code == 200
+    assert enqueue_response.json()["status"] == "queued"
+
+    audit_response = client.get(
+        f"/api/v1/projects/{project_id}/audit-events",
+        params={"action": "run.enqueue"},
+        headers=owner,
+    )
+    assert audit_response.status_code == 200
+    assert [event["resource_id"] for event in audit_response.json()] == [run_id]
+
+
 def test_canary_rollout_activation_routes_slug_runs_to_candidate(client: TestClient) -> None:
     owner = _headers()
 
@@ -456,6 +492,78 @@ def test_canary_rollout_activation_routes_slug_runs_to_candidate(client: TestCli
     assert run_response.status_code == 201
     assert run_response.json()["workflow_version_id"] == candidate_version_id
     assert run_response.json()["workflow_version_id"] != baseline_version_id
+
+
+def test_rollout_monitor_rolls_back_when_candidate_threshold_breaches(client: TestClient) -> None:
+    owner = _headers()
+
+    org_id = _create_org(client, actor_headers=owner, slug="rollout-monitor-corp")
+    project_id = _create_project(client, org_id=org_id, actor_headers=owner, slug="rollout-monitor-ops")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=owner)
+    baseline_version_id = _create_and_publish_workflow_version(
+        client,
+        workflow_id=workflow_id,
+        actor_headers=owner,
+        version="1.0.0",
+    )
+
+    candidate_payload = _workflow_version_payload(version="1.1.0")
+    candidate_payload["rollout_config"] = {
+        "strategy": "canary",
+        "baseline_version": "1.0.0",
+        "candidate_version": "1.1.0",
+        "traffic_split": {"baseline": 0, "candidate": 100},
+        "rollback_thresholds": {"schema_failure_rate": 0},
+    }
+    candidate_response = client.post(
+        f"/api/v1/workflows/{workflow_id}/versions",
+        json=candidate_payload,
+        headers=owner,
+    )
+    assert candidate_response.status_code == 201
+    candidate_version_id = candidate_response.json()["id"]
+    publish_candidate_response = client.post(
+        f"/api/v1/workflow-versions/{candidate_version_id}/publish",
+        json={"published_by": owner["X-Actor-User-Id"]},
+        headers=owner,
+    )
+    assert publish_candidate_response.status_code == 200
+
+    activate_response = client.post(
+        f"/api/v1/workflows/{workflow_id}/rollout/activate",
+        json={"candidate_version_id": candidate_version_id},
+        headers=owner,
+    )
+    assert activate_response.status_code == 200
+
+    run_response = client.post(
+        f"/api/v1/projects/{project_id}/workflows/support-ticket-resolution/runs",
+        json={
+            "input_payload": {
+                "ticket_id": "T-ROLLBACK",
+                "customer_id": "C-200",
+                "message": "__force_worker_failure__",
+            },
+        },
+        headers=owner,
+    )
+    assert run_response.status_code == 201
+    assert run_response.json()["workflow_version_id"] == candidate_version_id
+
+    execute_response = client.post(
+        f"/api/v1/projects/{project_id}/runs/{run_response.json()['id']}/execute",
+        headers=owner,
+    )
+    assert execute_response.status_code == 200
+    assert execute_response.json()["status"] == "failed"
+
+    monitor_response = client.post(f"/api/v1/workflows/{workflow_id}/rollout/monitor", headers=owner)
+    assert monitor_response.status_code == 200
+    monitor = monitor_response.json()
+    assert monitor["decision"] == "rolled_back"
+    assert monitor["thresholds_breached"] == ["schema_failure_rate"]
+    assert monitor["active_version_id"] == baseline_version_id
+    assert monitor["candidate_version_id"] == candidate_version_id
 
 
 def test_support_demo_connector_seed_and_tool_registry(client: TestClient) -> None:
@@ -866,6 +974,13 @@ def test_eval_run_executes_dataset_and_records_case_results(client: TestClient) 
     )
     assert create_eval_response.status_code == 201
     eval_run_id = create_eval_response.json()["id"]
+
+    enqueue_eval_response = client.post(
+        f"/api/v1/projects/{project_id}/eval-runs/{eval_run_id}/enqueue",
+        headers=owner,
+    )
+    assert enqueue_eval_response.status_code == 200
+    assert enqueue_eval_response.json()["status"] == "queued"
 
     execute_response = client.post(f"/api/v1/projects/{project_id}/eval-runs/{eval_run_id}/execute", headers=owner)
     assert execute_response.status_code == 200

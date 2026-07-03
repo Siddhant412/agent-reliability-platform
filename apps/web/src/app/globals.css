@@ -181,6 +181,11 @@ code {
   grid-row: span 2;
 }
 
+.workflowPanel {
+  grid-column: span 3;
+  min-height: 220px;
+}
+
 .detailPanel {
   min-height: 250px;
 }
@@ -198,6 +203,8 @@ code {
 .toolList,
 .evalList,
 .auditList,
+.workflowList,
+.versionList,
 .callList,
 .timeline {
   display: grid;
@@ -215,6 +222,64 @@ code {
   min-height: 62px;
   padding: 10px 12px;
   text-align: left;
+}
+
+.workflowBrowser {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(220px, 0.9fr) minmax(280px, 1fr) minmax(320px, 1.2fr);
+  padding: 12px;
+}
+
+.workflowList,
+.versionList {
+  border: 1px solid var(--line);
+  max-height: 260px;
+}
+
+.workflowRow,
+.versionRow {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 4px;
+  justify-content: stretch;
+  min-height: 48px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.workflowRow.selected,
+.versionRow.selected {
+  background: #eef7ff;
+}
+
+.workflowRow strong {
+  font-size: 13px;
+}
+
+.workflowRow span,
+.versionRow span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.versionRow {
+  grid-template-columns: max-content 1fr max-content;
+  align-items: center;
+}
+
+.rolloutBox {
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+  min-height: 180px;
+  padding: 10px;
+}
+
+.rolloutActions {
+  display: flex;
+  gap: 8px;
 }
 
 .runRow.selected {
@@ -428,9 +493,14 @@ code {
   }
 
   .timelinePanel,
+  .workflowPanel,
   .callsPanel,
   .auditPanel {
     grid-column: span 2;
+  }
+
+  .workflowBrowser {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -447,6 +517,7 @@ code {
   }
 
   .timelinePanel,
+  .workflowPanel,
   .callsPanel,
   .auditPanel {
     grid-column: span 1;

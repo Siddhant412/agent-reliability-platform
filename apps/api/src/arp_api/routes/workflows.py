@@ -20,6 +20,7 @@ from arp_core.contracts.serializers import workflow_to_read, workflow_version_to
 from arp_core.contracts.workflow import (
     ActivateWorkflowRolloutRequest,
     PublishWorkflowVersionRequest,
+    RolloutMonitorRead,
     SetActiveWorkflowVersionRequest,
     WorkflowCreate,
     WorkflowRead,
@@ -143,6 +144,19 @@ def activate_workflow_rollout(
         actor_user_id=actor.user_id,
     )
     return workflow_to_read(workflow)
+
+
+@router.post("/api/v1/workflows/{workflow_id}/rollout/monitor", response_model=RolloutMonitorRead)
+def monitor_workflow_rollout(
+    workflow_id: UUID,
+    _: Annotated[
+        authz.WorkflowAccess,
+        Depends(require_workflow_access(permission=authz.ensure_project_can_write_workflows)),
+    ],
+    session: Annotated[Session, Depends(get_db_session)],
+    actor: Annotated[AuthenticatedActor, Depends(get_authenticated_actor)],
+) -> RolloutMonitorRead:
+    return services.monitor_workflow_rollout(session, workflow_id=workflow_id, actor_user_id=actor.user_id)
 
 
 @router.patch("/api/v1/workflow-versions/{workflow_version_id}", response_model=WorkflowVersionRead)

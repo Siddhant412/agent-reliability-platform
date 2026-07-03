@@ -27,6 +27,7 @@ from arp_core.contracts.tooling import ConnectorCreate, ToolDefinitionCreate
 from arp_core.contracts.workflow import (
     ActivateWorkflowRolloutRequest,
     PublishWorkflowVersionRequest,
+    RolloutMonitorRead,
     SetActiveWorkflowVersionRequest,
     WorkflowCreate,
     WorkflowVersionCreate,
@@ -274,6 +275,14 @@ def _resolve_active_rollout_version(
         "baseline_version_id": str(baseline.id),
         "candidate_version_id": str(active_version.id),
     }
+
+
+def _p95_latency(values: list[int]) -> int | None:
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    index = max(0, min(len(sorted_values) - 1, int((len(sorted_values) * 0.95) - 1)))
+    return sorted_values[index]
 
 
 def list_organizations(session: Session) -> list[Organization]:
@@ -787,6 +796,35 @@ def get_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -> Ev
     )
 
 
+def enqueue_eval_run(
+    session: Session,
+    *,
+    project_id: UUID,
+    eval_run_id: UUID,
+    actor_user_id: UUID | None,
+) -> EvalRun:
+    eval_run = get_eval_run(session, project_id=project_id, eval_run_id=eval_run_id)
+    if eval_run.status != EvalRunStatus.QUEUED:
+        raise ConflictError("only queued eval runs can be enqueued")
+    project = _first_or_404(session, select(Project).where(Project.id == project_id), "project not found")
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=project.org_id,
+        project_id=project_id,
+        action="eval_run.enqueue",
+        resource_type="eval_run",
+        resource_id=eval_run.id,
+        before_json=None,
+        after_json={
+            "status": eval_run.status.value,
+            "workflow_version_id": str(eval_run.workflow_version_id),
+            "baseline_version_id": str(eval_run.baseline_version_id) if eval_run.baseline_version_id else None,
+        },
+    )
+    return eval_run
+
+
 def create_eval_run(
     session: Session,
     *,
@@ -1267,6 +1305,135 @@ def activate_workflow_rollout(
     return workflow
 
 
+def monitor_workflow_rollout(
+    session: Session,
+    *,
+    workflow_id: UUID,
+    actor_user_id: UUID | None,
+) -> RolloutMonitorRead:
+    workflow = _first_or_404(
+        session,
+        select(Workflow).options(joinedload(Workflow.project)).where(Workflow.id == workflow_id),
+        "workflow not found",
+    )
+    if workflow.active_version_id is None:
+        return RolloutMonitorRead(workflow_id=workflow.id, decision="no_active_version")
+
+    candidate = session.scalar(
+        select(WorkflowVersion).where(
+            WorkflowVersion.id == workflow.active_version_id,
+            WorkflowVersion.workflow_id == workflow.id,
+            WorkflowVersion.status == WorkflowVersionStatus.PUBLISHED,
+        )
+    )
+    if candidate is None:
+        return RolloutMonitorRead(workflow_id=workflow.id, active_version_id=workflow.active_version_id, decision="inactive")
+
+    config = candidate.rollout_config_json or {}
+    if config.get("strategy") != RolloutStrategy.CANARY.value or config.get("candidate_version") != candidate.version:
+        return RolloutMonitorRead(
+            workflow_id=workflow.id,
+            active_version_id=candidate.id,
+            candidate_version_id=candidate.id,
+            decision="no_active_rollout",
+        )
+
+    baseline_version = config.get("baseline_version")
+    baseline = (
+        _get_published_workflow_version_by_version(session, workflow_id=workflow.id, version=str(baseline_version))
+        if baseline_version
+        else None
+    )
+    if baseline is None:
+        raise ConflictError("active rollout baseline version is not published")
+
+    candidate_runs = list(
+        session.scalars(
+            select(Run).where(
+                Run.project_id == workflow.project_id,
+                Run.workflow_version_id == candidate.id,
+                Run.status.in_(TERMINAL_RUN_STATUSES),
+            )
+        ).all()
+    )
+    baseline_runs = list(
+        session.scalars(
+            select(Run).where(
+                Run.project_id == workflow.project_id,
+                Run.workflow_version_id == baseline.id,
+                Run.status.in_(TERMINAL_RUN_STATUSES),
+            )
+        ).all()
+    )
+
+    candidate_failure_rate = (
+        len([run for run in candidate_runs if run.status != RunStatus.SUCCEEDED]) / len(candidate_runs)
+        if candidate_runs
+        else None
+    )
+    baseline_failure_rate = (
+        len([run for run in baseline_runs if run.status != RunStatus.SUCCEEDED]) / len(baseline_runs)
+        if baseline_runs
+        else None
+    )
+    candidate_p95_latency_ms = _p95_latency([run.latency_ms for run in candidate_runs if run.latency_ms is not None])
+    baseline_p95_latency_ms = _p95_latency([run.latency_ms for run in baseline_runs if run.latency_ms is not None])
+
+    thresholds = config.get("rollback_thresholds") or {}
+    breaches: list[str] = []
+    schema_failure_rate_threshold = thresholds.get("schema_failure_rate")
+    if (
+        schema_failure_rate_threshold is not None
+        and candidate_failure_rate is not None
+        and candidate_failure_rate > float(schema_failure_rate_threshold)
+    ):
+        breaches.append("schema_failure_rate")
+    p95_latency_threshold = thresholds.get("p95_latency_ms")
+    if (
+        p95_latency_threshold is not None
+        and candidate_p95_latency_ms is not None
+        and candidate_p95_latency_ms > int(p95_latency_threshold)
+    ):
+        breaches.append("p95_latency_ms")
+
+    decision = "healthy"
+    if breaches:
+        before_json = {"active_version_id": str(workflow.active_version_id)}
+        workflow.active_version_id = baseline.id
+        session.flush()
+        decision = "rolled_back"
+        record_audit_event(
+            session,
+            actor_user_id=actor_user_id,
+            org_id=workflow.project.org_id,
+            project_id=workflow.project_id,
+            action="workflow.rollout.rollback",
+            resource_type="workflow",
+            resource_id=workflow.id,
+            before_json=before_json,
+            after_json={
+                "active_version_id": str(baseline.id),
+                "candidate_version_id": str(candidate.id),
+                "thresholds_breached": breaches,
+            },
+        )
+
+    return RolloutMonitorRead(
+        workflow_id=workflow.id,
+        active_version_id=workflow.active_version_id,
+        baseline_version_id=baseline.id,
+        candidate_version_id=candidate.id,
+        decision=decision,
+        thresholds_breached=breaches,
+        candidate_runs=len(candidate_runs),
+        baseline_runs=len(baseline_runs),
+        candidate_failure_rate=candidate_failure_rate,
+        baseline_failure_rate=baseline_failure_rate,
+        candidate_p95_latency_ms=candidate_p95_latency_ms,
+        baseline_p95_latency_ms=baseline_p95_latency_ms,
+    )
+
+
 def list_runs(session: Session, *, project_id: UUID) -> list[Run]:
     return list(
         session.scalars(select(Run).where(Run.project_id == project_id).order_by(Run.created_at.desc())).all()
@@ -1364,6 +1531,31 @@ def get_run(session: Session, *, project_id: UUID, run_id: UUID) -> Run:
         select(Run).where(Run.project_id == project_id, Run.id == run_id),
         "run not found",
     )
+
+
+def enqueue_run(
+    session: Session,
+    *,
+    project_id: UUID,
+    run_id: UUID,
+    actor_user_id: UUID | None,
+) -> Run:
+    run = get_run(session, project_id=project_id, run_id=run_id)
+    if run.status not in {RunStatus.QUEUED, RunStatus.RESUMED}:
+        raise ConflictError("only queued or resumed runs can be enqueued")
+    project = _first_or_404(session, select(Project).where(Project.id == project_id), "project not found")
+    record_audit_event(
+        session,
+        actor_user_id=actor_user_id,
+        org_id=project.org_id,
+        project_id=project_id,
+        action="run.enqueue",
+        resource_type="run",
+        resource_id=run.id,
+        before_json=None,
+        after_json={"status": run.status.value, "workflow_version_id": str(run.workflow_version_id)},
+    )
+    return run
 
 
 def transition_run_status(

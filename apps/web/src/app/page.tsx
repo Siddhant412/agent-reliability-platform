@@ -6,6 +6,7 @@ import {
   Clock,
   Database,
   GitBranch,
+  GitCompareArrows,
   ListFilter,
   Play,
   RefreshCw,
@@ -126,6 +127,43 @@ type EvalCaseResult = {
   error: Record<string, unknown> | null;
 };
 
+type Workflow = {
+  id: string;
+  project_id: string;
+  active_version_id: string | null;
+  slug: string;
+  name: string;
+  domain: string;
+  description: string | null;
+};
+
+type WorkflowVersion = {
+  id: string;
+  workflow_id: string;
+  version: string;
+  status: string;
+  rollout_config: {
+    strategy: string;
+    baseline_version?: string | null;
+    candidate_version?: string | null;
+    traffic_split?: { baseline: number; candidate: number } | null;
+    rollback_thresholds?: Record<string, unknown> | null;
+  } | null;
+  published_at: string | null;
+};
+
+type RolloutMonitor = {
+  workflow_id: string;
+  active_version_id: string | null;
+  baseline_version_id: string | null;
+  candidate_version_id: string | null;
+  decision: string;
+  thresholds_breached: string[];
+  candidate_runs: number;
+  baseline_runs: number;
+  candidate_failure_rate: number | null;
+};
+
 type AuditEvent = {
   id: string;
   actor_user_id: string | null;
@@ -194,12 +232,21 @@ export default function ConsolePage() {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [evalRuns, setEvalRuns] = useState<EvalRun[]>([]);
   const [evalResults, setEvalResults] = useState<EvalCaseResult[]>([]);
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [workflowVersions, setWorkflowVersions] = useState<WorkflowVersion[]>([]);
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
+  const [selectedVersionId, setSelectedVersionId] = useState("");
+  const [rolloutMonitor, setRolloutMonitor] = useState<RolloutMonitor | null>(null);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const selectedRunId = timeline?.run.id ?? runs[0]?.id ?? "";
-  const selectedWorkflowVersionId = timeline?.run.workflow_version_id ?? runs[0]?.workflow_version_id ?? "";
+  const selectedWorkflowVersionId =
+    selectedVersionId || timeline?.run.workflow_version_id || runs[0]?.workflow_version_id || "";
+  const selectedWorkflow = workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? workflows[0] ?? null;
+  const selectedVersion =
+    workflowVersions.find((version) => version.id === selectedWorkflowVersionId) ?? workflowVersions[0] ?? null;
   const pendingApprovals = useMemo(() => approvals.filter((approval) => approval.status === "pending"), [approvals]);
   const latestEvalRun = evalRuns[0] ?? null;
 
@@ -284,6 +331,32 @@ export default function ConsolePage() {
     }
   }, [actorUserId, projectId]);
 
+  const loadWorkflows = useCallback(async () => {
+    if (!projectId) return;
+    setBusy("workflows");
+    setError(null);
+    try {
+      const records = await api<Workflow[]>(`/api/v1/projects/${projectId}/workflows`, actorUserId);
+      setWorkflows(records);
+      const nextWorkflow = records.find((record) => record.slug === workflowSlug) ?? records[0] ?? null;
+      if (nextWorkflow) {
+        setSelectedWorkflowId(nextWorkflow.id);
+        setWorkflowSlug(nextWorkflow.slug);
+        const versions = await api<WorkflowVersion[]>(`/api/v1/workflows/${nextWorkflow.id}/versions`, actorUserId);
+        setWorkflowVersions(versions);
+        setSelectedVersionId(nextWorkflow.active_version_id ?? versions[0]?.id ?? "");
+      } else {
+        setWorkflowVersions([]);
+        setSelectedWorkflowId("");
+        setSelectedVersionId("");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load workflows");
+    } finally {
+      setBusy(null);
+    }
+  }, [actorUserId, projectId, workflowSlug]);
+
   const loadAuditEvents = useCallback(async () => {
     if (!projectId) return;
     setBusy("audit");
@@ -298,8 +371,27 @@ export default function ConsolePage() {
   }, [actorUserId, projectId]);
 
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadRuns(), loadApprovals(), loadConnectors(), loadEvals(), loadAuditEvents()]);
-  }, [loadApprovals, loadAuditEvents, loadConnectors, loadEvals, loadRuns]);
+    await Promise.all([loadRuns(), loadApprovals(), loadConnectors(), loadEvals(), loadWorkflows(), loadAuditEvents()]);
+  }, [loadApprovals, loadAuditEvents, loadConnectors, loadEvals, loadRuns, loadWorkflows]);
+
+  async function chooseWorkflow(workflowId: string) {
+    const workflow = workflows.find((record) => record.id === workflowId);
+    if (!workflow) return;
+    setBusy(workflowId);
+    setError(null);
+    try {
+      setSelectedWorkflowId(workflow.id);
+      setWorkflowSlug(workflow.slug);
+      const versions = await api<WorkflowVersion[]>(`/api/v1/workflows/${workflow.id}/versions`, actorUserId);
+      setWorkflowVersions(versions);
+      setSelectedVersionId(workflow.active_version_id ?? versions[0]?.id ?? "");
+      setRolloutMonitor(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load workflow versions");
+    } finally {
+      setBusy(null);
+    }
+  }
 
   async function selectRun(runId: string) {
     setBusy(runId);
@@ -322,6 +414,19 @@ export default function ConsolePage() {
       await selectRun(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to execute run");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function enqueueRun(runId: string) {
+    setBusy("enqueue");
+    setError(null);
+    try {
+      await api<RunRecord>(`/api/v1/projects/${projectId}/runs/${runId}/enqueue`, actorUserId, { method: "POST" });
+      await Promise.all([loadRuns(), loadAuditEvents()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to enqueue run");
     } finally {
       setBusy(null);
     }
@@ -383,6 +488,42 @@ export default function ConsolePage() {
     }
   }
 
+  async function activateSelectedRollout() {
+    if (!selectedWorkflow || !selectedVersion) return;
+    setBusy("activate-rollout");
+    setError(null);
+    try {
+      const workflow = await api<Workflow>(`/api/v1/workflows/${selectedWorkflow.id}/rollout/activate`, actorUserId, {
+        method: "POST",
+        body: JSON.stringify({ candidate_version_id: selectedVersion.id }),
+      });
+      setWorkflows((records) => records.map((record) => (record.id === workflow.id ? workflow : record)));
+      await chooseWorkflow(workflow.id);
+      await loadAuditEvents();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to activate rollout");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function monitorSelectedRollout() {
+    if (!selectedWorkflow) return;
+    setBusy("monitor-rollout");
+    setError(null);
+    try {
+      const result = await api<RolloutMonitor>(`/api/v1/workflows/${selectedWorkflow.id}/rollout/monitor`, actorUserId, {
+        method: "POST",
+      });
+      setRolloutMonitor(result);
+      await Promise.all([loadWorkflows(), loadAuditEvents()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to monitor rollout");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function createAndRunEval() {
     if (!projectId || !selectedWorkflowVersionId) return;
     setBusy("eval");
@@ -401,12 +542,12 @@ export default function ConsolePage() {
           workflow_version_id: selectedWorkflowVersionId,
         }),
       });
-      await api<EvalRun>(`/api/v1/projects/${projectId}/eval-runs/${evalRun.id}/execute`, actorUserId, {
+      await api<EvalRun>(`/api/v1/projects/${projectId}/eval-runs/${evalRun.id}/enqueue`, actorUserId, {
         method: "POST",
       });
-      await Promise.all([loadEvals(), loadRuns()]);
+      await Promise.all([loadEvals(), loadRuns(), loadAuditEvents()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to run eval");
+      setError(err instanceof Error ? err.message : "Unable to queue eval");
     } finally {
       setBusy(null);
     }
@@ -463,6 +604,62 @@ export default function ConsolePage() {
       ) : null}
 
       <section className="grid">
+        <div className="panel workflowPanel">
+          <div className="panelHeader">
+            <h2>Workflows</h2>
+            <span>{workflows.length}</span>
+          </div>
+          <div className="workflowBrowser">
+            <div className="workflowList">
+              {workflows.map((workflow) => (
+                <button
+                  key={workflow.id}
+                  className={`workflowRow ${selectedWorkflowId === workflow.id ? "selected" : ""}`}
+                  onClick={() => chooseWorkflow(workflow.id)}
+                >
+                  <strong>{workflow.name}</strong>
+                  <span>{workflow.slug}</span>
+                </button>
+              ))}
+            </div>
+            <div className="versionList">
+              {workflowVersions.map((version) => (
+                <button
+                  key={version.id}
+                  className={`versionRow ${selectedWorkflowVersionId === version.id ? "selected" : ""}`}
+                  onClick={() => setSelectedVersionId(version.id)}
+                >
+                  <span className={`pill ${statusClass(version.status)}`}>{version.version}</span>
+                  <span>{version.status}</span>
+                  {selectedWorkflow?.active_version_id === version.id ? <strong>active</strong> : null}
+                </button>
+              ))}
+            </div>
+            <div className="rolloutBox">
+              <div className="rolloutActions">
+                <button
+                  onClick={activateSelectedRollout}
+                  disabled={!selectedWorkflow || !selectedVersion?.rollout_config || busy != null}
+                >
+                  <GitCompareArrows size={16} /> Activate
+                </button>
+                <button onClick={monitorSelectedRollout} disabled={!selectedWorkflow || busy != null}>
+                  <ShieldCheck size={16} /> Monitor
+                </button>
+              </div>
+              <pre>
+                {previewJson(
+                  rolloutMonitor ?? {
+                    active_version_id: selectedWorkflow?.active_version_id ?? null,
+                    selected_version_id: selectedWorkflowVersionId || null,
+                    rollout_config: selectedVersion?.rollout_config ?? null,
+                  },
+                )}
+              </pre>
+            </div>
+          </div>
+        </div>
+
         <div className="panel runsPanel">
           <div className="panelHeader">
             <h2>Runs</h2>
@@ -489,9 +686,17 @@ export default function ConsolePage() {
             <div className="headerActions">
               <button
                 className="iconButton"
+                onClick={() => selectedRunId && enqueueRun(selectedRunId)}
+                disabled={!selectedRunId || busy != null}
+                title="Enqueue"
+              >
+                <Play size={17} />
+              </button>
+              <button
+                className="iconButton"
                 onClick={() => selectedRunId && executeRun(selectedRunId)}
                 disabled={!selectedRunId || busy != null}
-                title="Execute"
+                title="Execute inline"
               >
                 <RotateCw size={17} />
               </button>
@@ -602,7 +807,7 @@ export default function ConsolePage() {
                 className="iconButton"
                 onClick={createAndRunEval}
                 disabled={!projectId || !selectedWorkflowVersionId || busy != null}
-                title="Run eval"
+                title="Queue eval"
               >
                 <Play size={17} />
               </button>
