@@ -6,6 +6,7 @@ import time
 from uuid import UUID
 
 from arp_core.persistence.session import SessionManager
+from arp_core.observability import configure_telemetry
 from arp_worker.evals import execute_eval_run
 from arp_worker.queue import process_work_queue
 from arp_worker.runner import execute_next_queued_run, execute_run
@@ -23,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--claim-ttl-seconds", type=int, default=300)
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--otel-endpoint", default=os.getenv("ARP_OTEL_ENDPOINT"))
     return parser.parse_args()
 
 
@@ -40,6 +42,7 @@ def main() -> int:
         raise SystemExit("--project-id is required when executing a specific run or eval run")
 
     manager = SessionManager(args.database_url)
+    configure_telemetry(service_name="arp-worker", endpoint=args.otel_endpoint)
     if args.run_id is not None:
         with manager.session() as session:
             result = execute_run(session, project_id=args.project_id, run_id=args.run_id)

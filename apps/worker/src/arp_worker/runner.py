@@ -17,6 +17,7 @@ from arp_core.contracts.run import RunTransitionRequest, ToolCallCreate, ToolCal
 from arp_core.domain.enums import ConnectorStatus, PolicyAction, RunStatus, SpanStatus, ToolCallStatus
 from arp_core.persistence.base import utcnow
 from arp_core.persistence.models import Connector, Run, ToolCall, ToolDefinition, WorkflowVersion
+from arp_core import observability
 from arp_core.tools.gateway import LocalSupportToolGateway, ToolExecutionRequest, ToolGateway, ToolGatewayError
 
 
@@ -265,9 +266,13 @@ def _execute_tool_call(
             f"tool call '{tool_call.id}' cannot be executed from status {tool_call.status.value}"
         )
     try:
-        result = tool_gateway.execute(
-            ToolExecutionRequest(project_id=project_id, run_id=run_id, tool_name=tool_name, args=args)
-        )
+        with observability.span(
+            "arp.tool.execute",
+            attributes={"tool.name": tool_name, "run.id": str(run_id), "project.id": str(project_id)},
+        ):
+            result = tool_gateway.execute(
+                ToolExecutionRequest(project_id=project_id, run_id=run_id, tool_name=tool_name, args=args)
+            )
     except ToolGatewayError as exc:
         execute_span = _span(
             run_id=run_id,
@@ -793,12 +798,25 @@ def execute_next_queued_run(
     if claimed_run is None:
         return None
     run, was_resumed = claimed_run
-    return execute_run(
-        session,
-        project_id=run.project_id,
-        run_id=run.id,
-        tool_gateway=tool_gateway,
-        claimed=True,
-        resumed=was_resumed,
-        max_attempts=max_attempts,
+    observability.record_worker_event(
+        "arp.worker.run_claimed",
+        attributes={"project.id": str(run.project_id), "resumed": was_resumed},
     )
+    with observability.span(
+        "arp.worker.process_run",
+        attributes={"run.id": str(run.id), "project.id": str(run.project_id), "attempt": run.attempt_count},
+    ):
+        result = execute_run(
+            session,
+            project_id=run.project_id,
+            run_id=run.id,
+            tool_gateway=tool_gateway,
+            claimed=True,
+            resumed=was_resumed,
+            max_attempts=max_attempts,
+        )
+    observability.record_worker_event(
+        "arp.worker.run_completed",
+        attributes={"project.id": str(run.project_id), "status": result.status.value},
+    )
+    return result

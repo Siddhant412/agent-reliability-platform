@@ -12,6 +12,10 @@ dependencies = [
   "alembic>=1.16.5",
   "fastapi>=0.116.1",
   "jsonschema>=4.25.1",
+  "opentelemetry-api>=1.36.0",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.36.0",
+  "opentelemetry-instrumentation-fastapi>=0.57b0",
+  "opentelemetry-sdk>=1.36.0",
   "psycopg[binary]>=3.2.10",
   "pydantic>=2.11.4",
   "pydantic-settings>=2.10.1",
@@ -56,3 +60,6 @@ pythonpath = [
   "packages/support-demo/src",
 ]
 testpaths = ["tests"]
+markers = [
+  "postgres: requires ARP_TEST_POSTGRES_URL and a disposable PostgreSQL database",
+]

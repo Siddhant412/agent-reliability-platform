@@ -12,7 +12,9 @@ from arp_core.persistence.base import ensure_sqlite_directory
 
 class SessionManager:
     def __init__(self, database_url: str):
-        engine_kwargs: dict[str, object] = {"future": True}
+        # Reconnect cleanly after a database restart instead of reusing a stale
+        # pooled connection in the API or long-running worker.
+        engine_kwargs: dict[str, object] = {"future": True, "pool_pre_ping": True}
         if database_url.startswith("sqlite"):
             engine_kwargs["connect_args"] = {"check_same_thread": False}
         ensure_sqlite_directory(database_url)

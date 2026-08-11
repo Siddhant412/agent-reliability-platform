@@ -34,6 +34,7 @@ services:
       ]
     environment:
       ARP_DATABASE_URL: postgresql+psycopg://${ARP_POSTGRES_USER:-arp}:${ARP_POSTGRES_PASSWORD:-arp-local-only}@postgres:5432/${ARP_POSTGRES_DB:-arp}
+      ARP_OTEL_ENDPOINT: otel-collector:4317
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,8 +56,10 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.python
     command: ["arp-worker-run", "--queue-kind", "all", "--poll"]
+    restart: unless-stopped
     environment:
       ARP_DATABASE_URL: postgresql+psycopg://${ARP_POSTGRES_USER:-arp}:${ARP_POSTGRES_PASSWORD:-arp-local-only}@postgres:5432/${ARP_POSTGRES_DB:-arp}
+      ARP_OTEL_ENDPOINT: otel-collector:4317
     depends_on:
       api:
         condition: service_healthy

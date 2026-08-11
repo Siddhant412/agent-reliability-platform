@@ -23,6 +23,7 @@ from arp_core.application.exceptions import (
     NotFoundError,
 )
 from arp_core.persistence.session import SessionManager
+from arp_core.observability import configure_telemetry
 
 
 def create_app(*, database_url: str | None = None) -> FastAPI:
@@ -30,6 +31,11 @@ def create_app(*, database_url: str | None = None) -> FastAPI:
     app = FastAPI(title=settings.app_name, version="0.1.0")
     app.state.settings = settings
     app.state.session_manager = SessionManager(settings.database_url)
+    configure_telemetry(service_name="arp-api", endpoint=settings.otel_endpoint)
+    if settings.otel_endpoint:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz")
 
     @app.exception_handler(NotFoundError)
     async def handle_not_found(_: Request, exc: NotFoundError) -> JSONResponse:

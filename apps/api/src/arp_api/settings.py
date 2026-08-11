@@ -15,6 +15,7 @@ class APISettings(BaseSettings):
     database_url: str = "sqlite+pysqlite:///./.arp/dev.db"
     auth_mode: Literal["development_header", "api_key"] = "development_header"
     api_tokens: dict[str, UUID] = Field(default_factory=dict)
+    otel_endpoint: str | None = None
 
 
 @lru_cache(maxsize=1)

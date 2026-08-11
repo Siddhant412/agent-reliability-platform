@@ -2,13 +2,14 @@ FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
-COPY pyproject.toml README.md alembic.ini ./
+COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY apps ./apps
 COPY packages ./packages
 COPY scripts ./scripts
 
-RUN pip install .
+RUN pip install uv==0.12.3 && uv sync --frozen --no-dev

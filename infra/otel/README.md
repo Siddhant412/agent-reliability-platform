@@ -5,10 +5,11 @@ Collector configuration used by `infra/docker/docker-compose.yml`. It accepts
 OTLP over gRPC (`4317`) and HTTP (`4318`) and prints batched telemetry through
 the Collector debug exporter.
 
-The current API and worker persist product traces in PostgreSQL but do not yet
-include an OTLP instrumentation/exporter dependency. Consequently, the
-collector is available for manual or future instrumented clients, but it does
-not receive telemetry from the current application by itself.
+When `ARP_OTEL_ENDPOINT` is set, the API exports FastAPI request spans and the
+worker exports processing/tool-execution spans plus queue outcome counters.
+The Compose stack sets the endpoint to `otel-collector:4317`; on a host process
+use `localhost:4317`. Product traces remain in PostgreSQL for the console and
+are separate from this runtime telemetry stream.
 
 The debug exporter is appropriate only for an isolated local environment. Do
 not send credentials, authorization headers, full request bodies, or customer

@@ -38,8 +38,8 @@ packages/
   workflow-spec/  workflow DSL schema and support-ticket example
   support-demo/   local support fixtures and deterministic tools
 infra/
-  docker/   planned local service config
-  otel/     planned collector config
+  docker/   local PostgreSQL, API, worker, and web Compose stack
+  otel/     local OTLP Collector configuration
 docs/
   architecture/
 scripts/
@@ -84,6 +84,8 @@ Equivalent direct commands:
 
 ```bash
 uv run pytest
+# Runs only when ARP_TEST_POSTGRES_URL identifies a disposable PostgreSQL database.
+ARP_TEST_POSTGRES_URL=postgresql+psycopg://user:password@localhost:5432/arp_test uv run pytest -m postgres
 uv run arp-worker-run --queue-kind all --max-items 10
 uv run arp-worker-run --queue-kind all --poll
 uv run python scripts/export_openapi.py
