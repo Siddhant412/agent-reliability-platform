@@ -7,7 +7,7 @@
     "build": "next build",
     "api:types": "cd ../.. && uv run python scripts/export_openapi.py",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "eslint ."
   },
   "dependencies": {
     "lucide-react": "^0.469.0",
@@ -19,6 +19,9 @@
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
+    "@eslint/eslintrc": "^3.3.1",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.1.4",
     "typescript": "^5.7.2"
   }
 }

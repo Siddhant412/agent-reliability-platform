@@ -1,0 +1,7 @@
+**
+!apps/
+!apps/web/
+!apps/web/**
+
+apps/web/node_modules/
+apps/web/.next/

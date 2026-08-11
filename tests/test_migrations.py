@@ -28,6 +28,12 @@ def test_alembic_upgrade_creates_core_tables(tmp_path, monkeypatch) -> None:
         "eval_runs",
         "audit_events",
     }.issubset(tables)
+    assert {column["name"] for column in inspector.get_columns("runs")}.issuperset(
+        {"claim_token", "claimed_at", "claim_expires_at", "attempt_count"}
+    )
+    assert {column["name"] for column in inspector.get_columns("eval_runs")}.issuperset(
+        {"claim_token", "claimed_at", "claim_expires_at", "attempt_count"}
+    )
+    assert "idempotency_key" in {column["name"] for column in inspector.get_columns("tool_calls")}
 
     engine.dispose()
-

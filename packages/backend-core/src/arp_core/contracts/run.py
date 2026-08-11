@@ -89,6 +89,7 @@ class ToolCallCreate(BaseModel):
     args: dict[str, Any]
     span_id: str | None = Field(default=None, min_length=1, max_length=16)
     approval_required: bool = False
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class ToolCallUpdate(BaseModel):
@@ -112,6 +113,7 @@ class ToolCallRead(BaseModel):
     approval_id: UUID | None = None
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
+    idempotency_key: str | None = None
     created_at: datetime
 
 

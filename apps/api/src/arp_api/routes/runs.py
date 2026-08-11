@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.orm import Session
 
 from arp_api.dependencies.auth import get_authenticated_actor, require_project_access
@@ -78,7 +78,7 @@ def transition_run_status(
     project_id: UUID,
     run_id: UUID,
     payload: RunTransitionRequest,
-    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_write_workflows))],
     session: Annotated[Session, Depends(get_db_session)],
 ) -> RunRead:
     run = services.transition_run_status(session, project_id=project_id, run_id=run_id, payload=payload)
@@ -89,9 +89,12 @@ def transition_run_status(
 def execute_run(
     project_id: UUID,
     run_id: UUID,
-    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    request: Request,
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_write_workflows))],
     session: Annotated[Session, Depends(get_db_session)],
 ) -> RunRead:
+    if request.app.state.settings.auth_mode != "development_header":
+        raise authz.AuthorizationError("inline execution is disabled outside development_header mode")
     execute_worker_run(session, project_id=project_id, run_id=run_id)
     run = services.get_run(session, project_id=project_id, run_id=run_id)
     return run_to_read(run)
@@ -164,7 +167,7 @@ def create_trace_span(
     project_id: UUID,
     run_id: UUID,
     payload: TraceSpanCreate,
-    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_access_runs))],
+    _: Annotated[authz.ProjectAccess, Depends(require_project_access(permission=authz.ensure_project_can_write_workflows))],
     session: Annotated[Session, Depends(get_db_session)],
 ) -> TraceSpanRead:
     span = services.create_trace_span(session, project_id=project_id, run_id=run_id, payload=payload)

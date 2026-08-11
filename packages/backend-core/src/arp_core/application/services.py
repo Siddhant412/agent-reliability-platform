@@ -11,6 +11,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from arp_core.application.audit import record_audit_event
+from arp_core.application.redaction import redact_payload
 from arp_core.application.exceptions import ApplicationError, ConflictError, NotFoundError
 from arp_core.application.auth import AuthenticatedActor
 from arp_core.contracts.eval import DatasetCreate, EvalCaseCreate, EvalRunCreate
@@ -109,6 +110,7 @@ ACTIVE_RUN_STATUSES = {RunStatus.RUNNING, RunStatus.AWAITING_APPROVAL, RunStatus
 ALLOWED_RUN_STATUS_TRANSITIONS = {
     RunStatus.QUEUED: {RunStatus.RUNNING, RunStatus.CANCELLED},
     RunStatus.RUNNING: {
+        RunStatus.QUEUED,
         RunStatus.AWAITING_APPROVAL,
         RunStatus.SUCCEEDED,
         RunStatus.FAILED,
@@ -910,6 +912,9 @@ def finish_eval_run(
     eval_run.status = status
     eval_run.summary_json = summary
     eval_run.ended_at = utcnow()
+    eval_run.claim_token = None
+    eval_run.claimed_at = None
+    eval_run.claim_expires_at = None
     session.flush()
     return eval_run
 
@@ -1579,6 +1584,11 @@ def transition_run_status(
         if run.started_at is not None and payload.latency_ms is None:
             run.latency_ms = _latency_ms_between(run.started_at, run.ended_at)
 
+    if payload.status != RunStatus.RUNNING:
+        run.claim_token = None
+        run.claimed_at = None
+        run.claim_expires_at = None
+
     if payload.final_output is not None:
         run.final_output_json = payload.final_output
     if payload.latency_ms is not None:
@@ -1646,8 +1656,8 @@ def create_trace_span(
         status=payload.status,
         started_at=payload.started_at or utcnow(),
         ended_at=payload.ended_at,
-        attributes_json=payload.attributes,
-        error_json=payload.error,
+        attributes_json=redact_payload(payload.attributes),
+        error_json=redact_payload(payload.error),
     )
     session.add(span)
     session.flush()
@@ -1676,16 +1686,29 @@ def create_tool_call(
     if run.status not in ACTIVE_RUN_STATUSES:
         raise ConflictError("tool calls can only be recorded while a run is active")
 
+    if payload.idempotency_key is not None:
+        existing = session.scalar(
+            select(ToolCall).where(
+                ToolCall.project_id == project_id,
+                ToolCall.idempotency_key == payload.idempotency_key,
+            )
+        )
+        if existing is not None:
+            if existing.run_id != run_id or existing.tool_name != payload.tool_name:
+                raise ConflictError("idempotency key is already associated with a different tool call")
+            return existing
+
     tool_call = ToolCall(
         project_id=project_id,
         run_id=run_id,
         span_id=payload.span_id,
         tool_name=payload.tool_name,
-        args_json=payload.args,
+        args_json=redact_payload(payload.args),
         status=ToolCallStatus.PROPOSED,
         approval_required=payload.approval_required,
         result_json=None,
         error_json=None,
+        idempotency_key=payload.idempotency_key,
     )
     session.add(tool_call)
     session.flush()
@@ -1714,10 +1737,10 @@ def update_tool_call(
     if payload.span_id is not None:
         tool_call.span_id = payload.span_id
     if payload.status == ToolCallStatus.EXECUTED:
-        tool_call.result_json = payload.result or {}
+        tool_call.result_json = redact_payload(payload.result or {})
         tool_call.error_json = None
     if payload.status == ToolCallStatus.FAILED:
-        tool_call.error_json = payload.error or {}
+        tool_call.error_json = redact_payload(payload.error or {})
     if payload.status in TERMINAL_TOOL_CALL_STATUSES and payload.status != ToolCallStatus.FAILED:
         tool_call.error_json = None
 
@@ -1786,8 +1809,8 @@ def create_approval_request(
         approver_role=approver_role,
         status=ApprovalStatus.PENDING,
         reason=reason,
-        run_context_json=run_context,
-        proposed_effect_json=proposed_effect,
+        run_context_json=redact_payload(run_context),
+        proposed_effect_json=redact_payload(proposed_effect),
     )
     session.add(approval)
     session.flush()

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError as JSONSchemaValidationError
@@ -13,8 +14,9 @@ from arp_core.application import services
 from arp_core.application.exceptions import ConflictError, NotFoundError
 from arp_core.application.policies import evaluate_policy_pack
 from arp_core.contracts.run import RunTransitionRequest, ToolCallCreate, ToolCallUpdate, TraceSpanCreate
-from arp_core.domain.enums import PolicyAction, RunStatus, SpanStatus, ToolCallStatus
-from arp_core.persistence.models import Run, ToolCall, WorkflowVersion
+from arp_core.domain.enums import ConnectorStatus, PolicyAction, RunStatus, SpanStatus, ToolCallStatus
+from arp_core.persistence.base import utcnow
+from arp_core.persistence.models import Connector, Run, ToolCall, ToolDefinition, WorkflowVersion
 from arp_core.tools.gateway import LocalSupportToolGateway, ToolExecutionRequest, ToolGateway, ToolGatewayError
 
 
@@ -54,16 +56,54 @@ def _load_executable_run(session: Session, *, project_id: UUID, run_id: UUID) ->
     return run
 
 
-def _next_queued_run(session: Session, *, project_id: UUID | None = None) -> Run | None:
+def _claim_next_queued_run(
+    session: Session,
+    *,
+    project_id: UUID | None = None,
+    claim_ttl_seconds: int = 300,
+) -> tuple[Run, bool] | None:
+    """Lock and claim one queued/resumed run before invoking any tool.
+
+    PostgreSQL uses `SKIP LOCKED`; SQLite serializes the write transaction. The
+    claim remains visible in the row for recovery if the worker exits.
+    """
+    now = utcnow()
+    expired = (
+        Run.claim_expires_at.is_not(None)
+        & (Run.claim_expires_at <= now)
+        & (Run.status == RunStatus.RUNNING)
+    )
+    session.query(Run).filter(expired).update(
+        {
+            Run.status: RunStatus.QUEUED,
+            Run.claim_token: None,
+            Run.claimed_at: None,
+            Run.claim_expires_at: None,
+        },
+        synchronize_session=False,
+    )
     statement = (
         select(Run)
         .options(joinedload(Run.workflow_version).joinedload(WorkflowVersion.workflow))
-        .where(Run.status == RunStatus.QUEUED)
+        .where(Run.status.in_({RunStatus.QUEUED, RunStatus.RESUMED}))
         .order_by(Run.created_at)
+        .with_for_update(of=Run, skip_locked=True)
     )
     if project_id is not None:
         statement = statement.where(Run.project_id == project_id)
-    return session.scalar(statement)
+    run = session.scalar(statement)
+    if run is None:
+        return None
+    was_resumed = run.status == RunStatus.RESUMED
+    run.status = RunStatus.RUNNING
+    run.claim_token = uuid4().hex
+    run.claimed_at = now
+    run.claim_expires_at = now + timedelta(seconds=claim_ttl_seconds)
+    run.attempt_count += 1
+    if run.started_at is None:
+        run.started_at = now
+    session.flush()
+    return run, was_resumed
 
 
 def _span(
@@ -110,6 +150,43 @@ def _workflow_tool_names(run: Run) -> set[str]:
         elif isinstance(item, dict) and "name" in item:
             names.add(str(item["name"]))
     return names
+
+
+def _validate_mutating_tool_configuration(session: Session, *, run: Run, tool_name: str, args: dict[str, Any]) -> None:
+    """Require mutating actions to be declared by the published workflow.
+
+    A connector-bound reference additionally checks active connector metadata
+    and its JSON Schema before the gateway can receive provider arguments.
+    """
+    matching_refs = [
+        item for item in run.workflow_version.tool_set_json
+        if (item == tool_name) or (isinstance(item, dict) and item.get("name") == tool_name)
+    ]
+    if not matching_refs:
+        raise DeterministicWorkerError(f"mutating tool '{tool_name}' is not in the published workflow tool set")
+    connector_id = next(
+        (item.get("connector_id") for item in matching_refs if isinstance(item, dict) and item.get("connector_id")),
+        None,
+    )
+    if connector_id is None:
+        return
+    tool = session.scalar(
+        select(ToolDefinition)
+        .join(Connector, Connector.id == ToolDefinition.connector_id)
+        .where(
+            ToolDefinition.connector_id == connector_id,
+            ToolDefinition.name == tool_name,
+            Connector.project_id == run.project_id,
+            Connector.status == ConnectorStatus.ACTIVE,
+        )
+    )
+    if tool is None:
+        raise DeterministicWorkerError(f"active connector tool definition not found for '{tool_name}'")
+    try:
+        Draft202012Validator.check_schema(tool.input_schema_json)
+        Draft202012Validator(tool.input_schema_json).validate(args)
+    except (SchemaError, JSONSchemaValidationError) as exc:
+        raise DeterministicWorkerError(f"tool input validation failed for '{tool_name}': {exc.message}") from exc
 
 
 def _needs_refund(message: str) -> bool:
@@ -181,6 +258,12 @@ def _execute_tool_call(
     parent_span_id: str | None,
     tool_gateway: ToolGateway,
 ) -> dict[str, Any]:
+    if tool_call.status == ToolCallStatus.EXECUTED:
+        return tool_call.result_json or {}
+    if tool_call.status not in {ToolCallStatus.PROPOSED, ToolCallStatus.APPROVED}:
+        raise DeterministicWorkerError(
+            f"tool call '{tool_call.id}' cannot be executed from status {tool_call.status.value}"
+        )
     try:
         result = tool_gateway.execute(
             ToolExecutionRequest(project_id=project_id, run_id=run_id, tool_name=tool_name, args=args)
@@ -251,7 +334,12 @@ def _run_support_tool(
         session,
         project_id=project_id,
         run_id=run_id,
-        payload=ToolCallCreate(tool_name=tool_name, args=args, span_id=proposed_span.span_id),
+        payload=ToolCallCreate(
+            tool_name=tool_name,
+            args=args,
+            span_id=proposed_span.span_id,
+            idempotency_key=str(args.get("idempotency_key")) if args.get("idempotency_key") else None,
+        ),
     )
 
     return _execute_tool_call(
@@ -276,6 +364,7 @@ def _run_policy_gated_tool(
     args: dict[str, Any],
     tool_gateway: ToolGateway,
 ) -> str:
+    _validate_mutating_tool_configuration(session, run=run, tool_name=tool_name, args=args)
     proposed_span = _span(
         run_id=run.id,
         trace_id=trace_id,
@@ -294,6 +383,7 @@ def _run_policy_gated_tool(
             args=args,
             span_id=proposed_span.span_id,
             approval_required=True,
+            idempotency_key=str(args.get("idempotency_key")) if args.get("idempotency_key") else None,
         ),
     )
 
@@ -404,6 +494,12 @@ def _execute_approved_tool_calls(session: Session, *, run: Run, trace_id: str, t
     for tool_call in services.list_tool_calls(session, project_id=run.project_id, run_id=run.id):
         if tool_call.status != ToolCallStatus.APPROVED:
             continue
+        _validate_mutating_tool_configuration(
+            session,
+            run=run,
+            tool_name=tool_call.tool_name,
+            args=tool_call.args_json,
+        )
         _execute_tool_call(
             session,
             project_id=run.project_id,
@@ -551,19 +647,27 @@ def execute_run(
     project_id: UUID,
     run_id: UUID,
     tool_gateway: ToolGateway | None = None,
+    claimed: bool = False,
+    resumed: bool | None = None,
+    max_attempts: int = 1,
 ) -> WorkerExecutionResult:
-    run = _load_executable_run(session, project_id=project_id, run_id=run_id)
-    gateway = tool_gateway or LocalSupportToolGateway()
-    trace_id = _stable_hex(f"run:{run.id}", length=32)
-    workflow = run.workflow_version.workflow
-    is_resumed = run.status == RunStatus.RESUMED
-
-    services.transition_run_status(
-        session,
-        project_id=project_id,
-        run_id=run_id,
-        payload=RunTransitionRequest(status=RunStatus.RUNNING),
+    run = _load_run(session, project_id=project_id, run_id=run_id) if claimed else _load_executable_run(
+        session, project_id=project_id, run_id=run_id
     )
+    if claimed and run.status != RunStatus.RUNNING:
+        raise ConflictError("claimed run is no longer running")
+    gateway = tool_gateway or LocalSupportToolGateway()
+    trace_id = _stable_hex(f"run:{run.id}:attempt:{run.attempt_count}", length=32)
+    workflow = run.workflow_version.workflow
+    is_resumed = resumed if resumed is not None else run.status == RunStatus.RESUMED
+
+    if not claimed:
+        services.transition_run_status(
+            session,
+            project_id=project_id,
+            run_id=run_id,
+            payload=RunTransitionRequest(status=RunStatus.RUNNING),
+        )
     _emit_span(
         session,
         project_id=project_id,
@@ -639,8 +743,9 @@ def execute_run(
 
         final_output = _build_output(run, tool_results)
         return _finish_run(session, run=run, trace_id=trace_id, final_output=final_output)
-    except (DeterministicWorkerError, ToolGatewayError) as exc:
+    except Exception as exc:
         error_type = exc.error_type if isinstance(exc, ToolGatewayError) else exc.__class__.__name__
+        retryable = claimed and run.attempt_count < max_attempts
         _emit_span(
             session,
             project_id=project_id,
@@ -648,8 +753,8 @@ def execute_run(
             payload=_span(
                 run_id=run_id,
                 trace_id=trace_id,
-                span_type="run.finish",
-                name="run.finish",
+                span_type="run.retry" if retryable else "run.finish",
+                name="run.retry" if retryable else "run.finish",
                 status=SpanStatus.ERROR,
                 error={"type": error_type, "message": str(exc)},
             ),
@@ -658,7 +763,7 @@ def execute_run(
             session,
             project_id=project_id,
             run_id=run_id,
-            payload=RunTransitionRequest(status=RunStatus.FAILED),
+            payload=RunTransitionRequest(status=RunStatus.QUEUED if retryable else RunStatus.FAILED),
         )
         return WorkerExecutionResult(
             project_id=project_id,
@@ -675,8 +780,25 @@ def execute_next_queued_run(
     *,
     project_id: UUID | None = None,
     tool_gateway: ToolGateway | None = None,
+    claim_ttl_seconds: int = 300,
+    max_attempts: int = 3,
 ) -> WorkerExecutionResult | None:
-    run = _next_queued_run(session, project_id=project_id)
-    if run is None:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    claimed_run = _claim_next_queued_run(
+        session,
+        project_id=project_id,
+        claim_ttl_seconds=claim_ttl_seconds,
+    )
+    if claimed_run is None:
         return None
-    return execute_run(session, project_id=run.project_id, run_id=run.id, tool_gateway=tool_gateway)
+    run, was_resumed = claimed_run
+    return execute_run(
+        session,
+        project_id=run.project_id,
+        run_id=run.id,
+        tool_gateway=tool_gateway,
+        claimed=True,
+        resumed=was_resumed,
+        max_attempts=max_attempts,
+    )

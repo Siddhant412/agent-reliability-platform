@@ -26,7 +26,14 @@ class ParsedWorkflowDefinition:
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[5]
+    package_relative_root = Path(__file__).resolve().parents[5]
+    candidates = (package_relative_root, Path.cwd())
+    for candidate in candidates:
+        if (candidate / "packages" / "workflow-spec").is_dir():
+            return candidate
+    raise WorkflowDefinitionError(
+        "workflow-spec assets are unavailable; run from a repository checkout or package the workflow specification"
+    )
 
 
 def workflow_spec_root() -> Path:

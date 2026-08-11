@@ -11,8 +11,8 @@ Current implementation:
 
 - `arp_worker.runner.execute_run` executes one queued or resumed run
   deterministically.
-- `arp_worker.runner.execute_next_queued_run` picks the oldest queued run,
-  optionally within a project.
+- `arp_worker.runner.execute_next_queued_run` atomically claims the oldest
+  queued or resumed run, optionally within a project.
 - `arp_worker.evals.execute_next_queued_eval_run` picks the oldest queued eval
   run and executes its dataset.
 - `arp_worker.queue.process_work_queue` processes queued runs and eval runs in
@@ -24,6 +24,8 @@ Current implementation:
   queued work once.
 - `arp-worker-run --project-id <uuid> --queue-kind all --poll` keeps polling
   for queued work.
+- `--claim-ttl-seconds` bounds how long an interrupted worker owns a claim;
+  `--max-attempts` bounds retry attempts for claimed runs (defaults: 300 and 3).
 
 This is intentionally not a Temporal worker yet. It validates the persistence
 contract first: `queued -> running -> succeeded/failed`, approval pause/resume,
@@ -36,3 +38,9 @@ validates final output against the pinned workflow version schema.
 Tool execution goes through `arp_core.tools.gateway.ToolGateway`. The default
 local adapter uses support-demo tools, and future MCP/external adapters should
 implement the same gateway boundary.
+
+Run and eval claims are persisted with expiry timestamps. A worker requeues an
+expired claim before selecting new work; claimed run failures are retried until
+their configured attempt limit. Mutating tool calls persist a project-scoped
+idempotency key and reuse an already executed result instead of calling the
+gateway again.

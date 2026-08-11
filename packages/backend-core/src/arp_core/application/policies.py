@@ -113,6 +113,12 @@ def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
 
 
 def _compare(left: Any, operator: ast.cmpop, right: Any) -> bool:
+    if left is None or right is None:
+        if isinstance(operator, ast.Eq):
+            return left is right
+        if isinstance(operator, ast.NotEq):
+            return left is not right
+        return False
     if isinstance(operator, ast.Eq):
         return left == right
     if isinstance(operator, ast.NotEq):

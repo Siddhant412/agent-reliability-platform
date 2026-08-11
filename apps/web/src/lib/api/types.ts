@@ -289,6 +289,7 @@ export type ToolCallRead = {
   "approval_id"?: string | null;
   "result"?: Record<string, unknown> | null;
   "error"?: Record<string, unknown> | null;
+  "idempotency_key"?: string | null;
   "created_at": string;
 };
 

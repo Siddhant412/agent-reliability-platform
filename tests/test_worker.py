@@ -242,6 +242,10 @@ def test_deterministic_worker_executes_next_queued_run(db_session: Session) -> N
     assert "Handling duplicate charges" in run.final_output_json["summary"]
     assert run.tokens_input is not None
     assert run.tokens_output is not None
+    assert run.attempt_count == 1
+    assert run.claim_token is None
+    assert run.claimed_at is None
+    assert run.claim_expires_at is None
 
     spans = services.list_trace_spans(db_session, project_id=project.id, run_id=run.id)
     assert [span.span_type for span in spans] == [
@@ -326,6 +330,25 @@ def test_deterministic_worker_marks_failed_tool_call_and_run_failure(db_session:
         "type": "SupportToolError",
         "message": "forced support demo tool failure",
     }
+
+
+def test_claimed_worker_retries_once_before_marking_run_failed(db_session: Session) -> None:
+    project, _, run = _create_queued_run(db_session, message="__force_tool_failure__")
+
+    first_result = execute_next_queued_run(db_session, project_id=project.id, max_attempts=2)
+
+    assert first_result is not None
+    assert first_result.status == RunStatus.QUEUED
+    db_session.refresh(run)
+    assert run.attempt_count == 1
+    assert run.claim_token is None
+
+    second_result = execute_next_queued_run(db_session, project_id=project.id, max_attempts=2)
+
+    assert second_result is not None
+    assert second_result.status == RunStatus.FAILED
+    db_session.refresh(run)
+    assert run.attempt_count == 2
 
 
 def test_deterministic_worker_fails_when_final_output_violates_schema(db_session: Session) -> None:
@@ -445,8 +468,9 @@ def test_deterministic_worker_pauses_for_refund_approval_and_resumes(db_session:
     db_session.refresh(run)
     assert run.status == RunStatus.RESUMED
 
-    second_result = execute_run(db_session, project_id=project.id, run_id=run.id)
+    second_result = execute_next_queued_run(db_session, project_id=project.id)
 
+    assert second_result is not None
     assert second_result.status == RunStatus.SUCCEEDED
     assert second_result.workflow_version_id == version.id
     assert second_result.final_output is not None
@@ -462,3 +486,15 @@ def test_deterministic_worker_pauses_for_refund_approval_and_resumes(db_session:
     spans = services.list_trace_spans(db_session, project_id=project.id, run_id=run.id)
     assert "approval.wait" in [span.span_type for span in spans]
     assert "run.resume" in [span.span_type for span in spans]
+
+
+def test_worker_ignores_nonmatching_policy_with_missing_tool_argument(db_session: Session) -> None:
+    project, _, run = _create_queued_run(
+        db_session,
+        message="Where is my order?",
+        version_payload=_approval_workflow_version_payload(),
+    )
+
+    result = execute_run(db_session, project_id=project.id, run_id=run.id)
+
+    assert result.status == RunStatus.SUCCEEDED

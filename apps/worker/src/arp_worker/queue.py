@@ -22,12 +22,19 @@ def process_next_work_item(
     *,
     project_id: UUID | None = None,
     queue_kind: str = "all",
+    claim_ttl_seconds: int = 300,
+    max_attempts: int = 3,
 ) -> QueueItemResult | None:
     if queue_kind not in {"all", "run", "eval"}:
         raise ValueError("queue_kind must be one of: all, run, eval")
 
     if queue_kind in {"all", "run"}:
-        run_result = execute_next_queued_run(session, project_id=project_id)
+        run_result = execute_next_queued_run(
+            session,
+            project_id=project_id,
+            claim_ttl_seconds=claim_ttl_seconds,
+            max_attempts=max_attempts,
+        )
         if run_result is not None:
             return QueueItemResult(
                 work_type="run",
@@ -37,7 +44,11 @@ def process_next_work_item(
             )
 
     if queue_kind in {"all", "eval"}:
-        eval_result = execute_next_queued_eval_run(session, project_id=project_id)
+        eval_result = execute_next_queued_eval_run(
+            session,
+            project_id=project_id,
+            claim_ttl_seconds=claim_ttl_seconds,
+        )
         if eval_result is not None:
             return QueueItemResult(
                 work_type="eval_run",
@@ -55,10 +66,18 @@ def process_work_queue(
     project_id: UUID | None = None,
     queue_kind: str = "all",
     max_items: int = 1,
+    claim_ttl_seconds: int = 300,
+    max_attempts: int = 3,
 ) -> list[QueueItemResult]:
     results: list[QueueItemResult] = []
     for _ in range(max_items):
-        result = process_next_work_item(session, project_id=project_id, queue_kind=queue_kind)
+        result = process_next_work_item(
+            session,
+            project_id=project_id,
+            queue_kind=queue_kind,
+            claim_ttl_seconds=claim_ttl_seconds,
+            max_attempts=max_attempts,
+        )
         if result is None:
             break
         results.append(result)

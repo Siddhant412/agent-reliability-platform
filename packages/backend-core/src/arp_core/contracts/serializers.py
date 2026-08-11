@@ -16,6 +16,7 @@ from arp_core.contracts.workflow import (
     WorkflowToolRef,
     WorkflowVersionRead,
 )
+from arp_core.application.redaction import redact_payload
 from arp_core.persistence.models import (
     ApprovalRequest,
     AuditEvent,
@@ -84,8 +85,8 @@ def run_to_read(record: Run) -> RunRead:
         workflow_version_id=record.workflow_version_id,
         triggered_by=record.triggered_by,
         status=record.status,
-        input_payload=record.input_json,
-        final_output=record.final_output_json,
+        input_payload=redact_payload(record.input_json),
+        final_output=redact_payload(record.final_output_json),
         started_at=record.started_at,
         ended_at=record.ended_at,
         latency_ms=record.latency_ms,
@@ -111,8 +112,8 @@ def trace_span_to_read(record: TraceSpan) -> TraceSpanRead:
         status=record.status,
         started_at=record.started_at,
         ended_at=record.ended_at,
-        attributes=record.attributes_json,
-        error=record.error_json,
+        attributes=redact_payload(record.attributes_json),
+        error=redact_payload(record.error_json),
         created_at=record.created_at,
     )
 
@@ -124,12 +125,13 @@ def tool_call_to_read(record: ToolCall) -> ToolCallRead:
         run_id=record.run_id,
         span_id=record.span_id,
         tool_name=record.tool_name,
-        args=record.args_json,
+        args=redact_payload(record.args_json),
         status=record.status,
         approval_required=record.approval_required,
         approval_id=record.approval_id,
-        result=record.result_json,
-        error=record.error_json,
+        result=redact_payload(record.result_json),
+        error=redact_payload(record.error_json),
+        idempotency_key=record.idempotency_key,
         created_at=record.created_at,
     )
 
@@ -143,8 +145,8 @@ def approval_request_to_read(record: ApprovalRequest) -> ApprovalRequestRead:
         approver_role=record.approver_role,
         status=record.status,
         reason=record.reason,
-        run_context=record.run_context_json,
-        proposed_effect=record.proposed_effect_json,
+        run_context=redact_payload(record.run_context_json),
+        proposed_effect=redact_payload(record.proposed_effect_json),
         requested_at=record.requested_at,
         decided_at=record.decided_at,
         decided_by=record.decided_by,
@@ -161,8 +163,8 @@ def audit_event_to_read(record: AuditEvent) -> AuditEventRead:
         action=record.action,
         resource_type=record.resource_type,
         resource_id=record.resource_id,
-        before=record.before_json,
-        after=record.after_json,
+        before=redact_payload(record.before_json),
+        after=redact_payload(record.after_json),
         created_at=record.created_at,
     )
 

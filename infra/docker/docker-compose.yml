@@ -1,0 +1,101 @@
+name: agent-reliability-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${ARP_POSTGRES_DB:-arp}
+      POSTGRES_USER: ${ARP_POSTGRES_USER:-arp}
+      POSTGRES_PASSWORD: ${ARP_POSTGRES_PASSWORD:-arp-local-only}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    ports:
+      - "${ARP_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.python
+    command:
+      [
+        "sh",
+        "-c",
+        "alembic upgrade head && uvicorn arp_api.main:app --host 0.0.0.0 --port 8000",
+      ]
+    environment:
+      ARP_DATABASE_URL: postgresql+psycopg://${ARP_POSTGRES_USER:-arp}:${ARP_POSTGRES_PASSWORD:-arp-local-only}@postgres:5432/${ARP_POSTGRES_DB:-arp}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/healthz')\"",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    ports:
+      - "${ARP_API_PORT:-8000}:8000"
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.python
+    command: ["arp-worker-run", "--queue-kind", "all", "--poll"]
+    environment:
+      ARP_DATABASE_URL: postgresql+psycopg://${ARP_POSTGRES_USER:-arp}:${ARP_POSTGRES_PASSWORD:-arp-local-only}@postgres:5432/${ARP_POSTGRES_DB:-arp}
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.web
+      args:
+        ARP_API_BASE_URL: http://api:8000
+    environment:
+      ARP_API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${ARP_WEB_PORT:-3000}:3000"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ../otel/collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "${ARP_OTEL_GRPC_PORT:-4317}:4317"
+      - "${ARP_OTEL_HTTP_PORT:-4318}:4318"
+
+  bootstrap:
+    profiles: ["bootstrap"]
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.python
+    command: ["python", "scripts/bootstrap_demo.py"]
+    environment:
+      ARP_DATABASE_URL: postgresql+psycopg://${ARP_POSTGRES_USER:-arp}:${ARP_POSTGRES_PASSWORD:-arp-local-only}@postgres:5432/${ARP_POSTGRES_DB:-arp}
+      ARP_SEED_ACTOR_USER_ID: ${ARP_SEED_ACTOR_USER_ID:-00000000-0000-0000-0000-000000000001}
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

@@ -5,6 +5,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from arp_core.application.redaction import redact_payload
 from arp_core.persistence.models import AuditEvent
 
 
@@ -27,9 +28,8 @@ def record_audit_event(
         action=action,
         resource_type=resource_type,
         resource_id=resource_id,
-        before_json=before_json,
-        after_json=after_json,
+        before_json=redact_payload(before_json),
+        after_json=redact_payload(after_json),
     )
     session.add(event)
     return event
-

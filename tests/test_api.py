@@ -4,6 +4,8 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from arp_api.settings import APISettings
+
 
 def _workflow_version_payload(*, version: str = "1.0.0") -> dict:
     return {
@@ -144,6 +146,46 @@ def test_secured_routes_require_actor_identity_header(client: TestClient) -> Non
 
     assert response.status_code == 401
     assert response.json()["detail"] == "missing X-Actor-User-Id header"
+
+
+def test_api_key_mode_verifies_token_and_ignores_actor_header(client: TestClient) -> None:
+    actor_user_id = uuid4()
+    client.app.state.settings = APISettings(
+        auth_mode="api_key",
+        api_tokens={"a-long-test-token": actor_user_id},
+    )
+
+    assert client.get("/api/v1/organizations").status_code == 401
+    assert client.get("/api/v1/organizations", headers={"X-API-Key": "wrong"}).status_code == 401
+    response = client.post(
+        "/api/v1/organizations",
+        json={"name": "Token Org", "slug": "token-org"},
+        headers={"X-API-Key": "a-long-test-token", "X-Actor-User-Id": str(uuid4())},
+    )
+    assert response.status_code == 201
+
+
+def test_run_response_redacts_secret_key_fields(client: TestClient) -> None:
+    actor_headers = _headers()
+    org_id = _create_org(client, actor_headers=actor_headers, slug="redaction-org")
+    project_id = _create_project(client, org_id=org_id, actor_headers=actor_headers, slug="redaction-project")
+    workflow_id = _create_workflow(client, project_id=project_id, actor_headers=actor_headers)
+    version_id = _create_and_publish_workflow_version(client, workflow_id=workflow_id, actor_headers=actor_headers)
+    response = client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={
+            "workflow_version_id": version_id,
+            "input_payload": {
+                "ticket_id": "T-redact",
+                "customer_id": "C-redact",
+                "message": "Need help",
+                "api_key": "do-not-return-me",
+            },
+        },
+        headers=actor_headers,
+    )
+    assert response.status_code == 201
+    assert response.json()["input_payload"]["api_key"] == "[REDACTED]"
 
 
 def test_org_creator_is_bootstrapped_as_admin_and_org_list_is_tenant_filtered(client: TestClient) -> None:

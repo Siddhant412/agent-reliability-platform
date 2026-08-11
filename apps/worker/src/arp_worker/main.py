@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-items", type=int, default=1)
     parser.add_argument("--poll", action="store_true")
     parser.add_argument("--poll-interval", type=float, default=2.0)
+    parser.add_argument("--claim-ttl-seconds", type=int, default=300)
+    parser.add_argument("--max-attempts", type=int, default=3)
     return parser.parse_args()
 
 
@@ -28,6 +30,10 @@ def main() -> int:
     args = parse_args()
     if args.max_items < 1:
         raise SystemExit("--max-items must be at least 1")
+    if args.claim_ttl_seconds < 1:
+        raise SystemExit("--claim-ttl-seconds must be at least 1")
+    if args.max_attempts < 1:
+        raise SystemExit("--max-attempts must be at least 1")
     if args.run_id is not None and args.eval_run_id is not None:
         raise SystemExit("--run-id and --eval-run-id are mutually exclusive")
     if (args.run_id is not None or args.eval_run_id is not None) and args.project_id is None:
@@ -57,7 +63,12 @@ def main() -> int:
     while True:
         with manager.session() as session:
             if args.queue_kind == "run" and args.max_items == 1:
-                run_result = execute_next_queued_run(session, project_id=args.project_id)
+                run_result = execute_next_queued_run(
+                    session,
+                    project_id=args.project_id,
+                    claim_ttl_seconds=args.claim_ttl_seconds,
+                    max_attempts=args.max_attempts,
+                )
                 results = []
                 if run_result is not None:
                     results.append(
@@ -81,6 +92,8 @@ def main() -> int:
                         project_id=args.project_id,
                         queue_kind=args.queue_kind,
                         max_items=args.max_items,
+                        claim_ttl_seconds=args.claim_ttl_seconds,
+                        max_attempts=args.max_attempts,
                     )
                 ]
             session.commit()

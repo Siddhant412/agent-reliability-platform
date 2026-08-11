@@ -194,6 +194,10 @@ class Run(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     tokens_input: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_output: Mapped[int | None] = mapped_column(Integer, nullable=True)
     feedback_score: Mapped[Decimal | None] = mapped_column(Numeric(4, 2), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     workflow_version: Mapped["WorkflowVersion"] = relationship(back_populates="runs")
     trace_spans: Mapped[list["TraceSpan"]] = relationship(back_populates="run")
@@ -233,6 +237,7 @@ class ToolCall(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     __table_args__ = (
         Index("ix_tool_calls_run_status", "run_id", "status"),
         Index("ix_tool_calls_project_status", "project_id", "status"),
+        UniqueConstraint("project_id", "idempotency_key", name="uq_tool_calls_project_idempotency_key"),
     )
 
     project_id: Mapped[UUID] = mapped_column(UUID_TYPE, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
@@ -245,6 +250,7 @@ class ToolCall(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     approval_id: Mapped[UUID | None] = mapped_column(UUID_TYPE, nullable=True)
     result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON_TYPE, nullable=True)
     error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON_TYPE, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
     run: Mapped["Run"] = relationship(back_populates="tool_calls")
     approval_request: Mapped["ApprovalRequest | None"] = relationship(back_populates="tool_call")
@@ -327,6 +333,10 @@ class EvalRun(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     summary_json: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False, default=dict)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class EvalCaseResult(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):

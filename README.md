@@ -90,3 +90,10 @@ uv run python scripts/export_openapi.py
 ```
 
 Use `X-Actor-User-Id: <uuid>` when calling secured API routes directly.
+
+`X-Actor-User-Id` is deliberately limited to the default local
+`development_header` mode. For a deployed environment, set
+`ARP_AUTH_MODE=api_key` and configure the JSON `ARP_API_TOKENS` mapping from a
+long random API key to an existing user UUID; clients then send `X-API-Key`.
+Trace, tool, approval, and audit payloads redact conventional secret-key
+fields before storage and again before serialization.

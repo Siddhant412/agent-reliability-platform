@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -12,6 +13,7 @@ from arp_core.application.exceptions import ApplicationError
 from arp_core.contracts.run import RunSubmitRequest
 from arp_core.domain.enums import ApprovalStatus, EvalCaseStatus, EvalRunStatus, RunStatus, ToolCallStatus
 from arp_core.persistence.models import Dataset, EvalRun
+from arp_core.persistence.base import utcnow
 from arp_worker.runner import execute_run
 
 
@@ -45,8 +47,18 @@ class EvalAttemptResult:
         }
 
 
-def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -> EvalExecutionResult:
-    eval_run = services.mark_eval_run_running(session, project_id=project_id, eval_run_id=eval_run_id)
+def execute_eval_run(
+    session: Session,
+    *,
+    project_id: UUID,
+    eval_run_id: UUID,
+    claimed: bool = False,
+) -> EvalExecutionResult:
+    eval_run = services.get_eval_run(session, project_id=project_id, eval_run_id=eval_run_id) if claimed else (
+        services.mark_eval_run_running(session, project_id=project_id, eval_run_id=eval_run_id)
+    )
+    if claimed and eval_run.status != EvalRunStatus.RUNNING:
+        raise ApplicationError("claimed eval run is no longer running")
     cases = services.list_eval_cases(session, project_id=project_id, dataset_id=eval_run.dataset_id)
 
     totals = {
@@ -138,12 +150,32 @@ def execute_eval_run(session: Session, *, project_id: UUID, eval_run_id: UUID) -
     )
 
 
-def execute_next_queued_eval_run(session: Session, *, project_id: UUID | None = None) -> EvalExecutionResult | None:
+def execute_next_queued_eval_run(
+    session: Session,
+    *,
+    project_id: UUID | None = None,
+    claim_ttl_seconds: int = 300,
+) -> EvalExecutionResult | None:
+    now = utcnow()
+    session.query(EvalRun).filter(
+        EvalRun.status == EvalRunStatus.RUNNING,
+        EvalRun.claim_expires_at.is_not(None),
+        EvalRun.claim_expires_at <= now,
+    ).update(
+        {
+            EvalRun.status: EvalRunStatus.QUEUED,
+            EvalRun.claim_token: None,
+            EvalRun.claimed_at: None,
+            EvalRun.claim_expires_at: None,
+        },
+        synchronize_session=False,
+    )
     statement = (
         select(EvalRun)
         .join(Dataset, Dataset.id == EvalRun.dataset_id)
         .where(EvalRun.status == EvalRunStatus.QUEUED)
         .order_by(EvalRun.created_at)
+        .with_for_update(of=EvalRun, skip_locked=True)
     )
     if project_id is not None:
         statement = statement.where(Dataset.project_id == project_id)
@@ -153,7 +185,15 @@ def execute_next_queued_eval_run(session: Session, *, project_id: UUID | None = 
     eval_project_id = session.scalar(select(Dataset.project_id).where(Dataset.id == eval_run.dataset_id))
     if eval_project_id is None:
         return None
-    return execute_eval_run(session, project_id=eval_project_id, eval_run_id=eval_run.id)
+    eval_run.status = EvalRunStatus.RUNNING
+    eval_run.claim_token = uuid4().hex
+    eval_run.claimed_at = now
+    eval_run.claim_expires_at = now + timedelta(seconds=claim_ttl_seconds)
+    eval_run.attempt_count += 1
+    if eval_run.started_at is None:
+        eval_run.started_at = now
+    session.flush()
+    return execute_eval_run(session, project_id=eval_project_id, eval_run_id=eval_run.id, claimed=True)
 
 
 def _execute_eval_case(

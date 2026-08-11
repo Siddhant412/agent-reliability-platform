@@ -28,6 +28,7 @@ from arp_core.persistence.session import SessionManager
 def create_app(*, database_url: str | None = None) -> FastAPI:
     settings = APISettings(database_url=database_url) if database_url is not None else get_settings()
     app = FastAPI(title=settings.app_name, version="0.1.0")
+    app.state.settings = settings
     app.state.session_manager = SessionManager(settings.database_url)
 
     @app.exception_handler(NotFoundError)

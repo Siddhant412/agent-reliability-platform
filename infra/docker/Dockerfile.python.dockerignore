@@ -1,0 +1,14 @@
+**
+!pyproject.toml
+!README.md
+!alembic.ini
+!apps/
+!apps/**
+!packages/
+!packages/**
+!scripts/
+!scripts/**
+
+**/__pycache__/
+**/*.py[cod]
+apps/web/node_modules/
